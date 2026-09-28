@@ -153,8 +153,9 @@ producer and matching Rust record:
 
 ```sh
 cargo build --release --example generate_tracepoint
-sudo ./target/release/examples/generate_tracepoint \
-  sched sched_switch target/generated
+sudo cat /sys/kernel/tracing/events/sched/sched_switch/format | \
+  ./target/release/examples/generate_tracepoint \
+    --format-file /dev/stdin sched sched_switch target/generated
 
 clang -target bpfel -mcpu=v3 -O2 -I examples/bpf \
   -c target/generated/sched_sched_switch.bpf.c \
