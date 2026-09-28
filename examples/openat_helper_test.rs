@@ -5,13 +5,17 @@ use samurai::{
     bpf::object::ObjectLoader,
     mold::{MappedMold, TypedMoldEntry},
     record::OpenAtRecord,
-    utils::tracepoint::TracepointResolver,
+    utils::{affinity::pin_current_thread, tracepoint::TracepointResolver},
 };
 use std::{collections::BTreeMap, ffi::CString, io};
 
 const WORDS: usize = 16;
 
 fn main() -> io::Result<()> {
+    // The legacy tracepoint perf event is opened on CPU 0. Keep this focused
+    // helper test on that CPU so its four syscalls cannot race attachment
+    // propagation while the assertions are running.
+    pin_current_thread(0)?;
     let object = std::env::args().nth(1).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,

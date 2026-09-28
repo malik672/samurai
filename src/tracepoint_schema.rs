@@ -364,7 +364,14 @@ fn invalid(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, process::Command, time::SystemTime};
+    use std::{
+        fs,
+        process::Command,
+        sync::atomic::{AtomicU64, Ordering},
+        time::SystemTime,
+    };
+
+    static SCHEMA_TEST_ID: AtomicU64 = AtomicU64::new(0);
 
     const SCHED_SWITCH: &str = r#"name: sched_switch
 ID: 252
@@ -451,7 +458,8 @@ format:
                     .unwrap_or(SystemTime::UNIX_EPOCH)
             })
             .expect("Cargo must build the Samurai rlib before its unit tests");
-        let directory = dependencies.join(format!("schema-test-{}", std::process::id()));
+        let test_id = SCHEMA_TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let directory = dependencies.join(format!("schema-test-{}-{test_id}", std::process::id()));
         fs::create_dir_all(&directory).unwrap();
         let input = directory.join("generated.rs");
         let output = directory.join("libgenerated.rlib");
