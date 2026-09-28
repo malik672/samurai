@@ -4,4 +4,5 @@ pub mod mold;
 pub mod perf;
 pub mod profile;
 pub mod record;
+pub mod tracepoint_schema;
 pub mod utils;

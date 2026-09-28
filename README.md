@@ -146,6 +146,27 @@ user-string helper as Aya to capture up to 63 pathname bytes, reads every CPU
 lane as typed `OpenAtRecord` values, and reports exact gaps. Its 64K-slot lanes
 reserve about 72 MiB for the wider path-bearing records.
 
+### Generate a tracepoint schema
+
+Samurai can turn Linux's authoritative tracepoint format into a fixed Mold BPF
+producer and matching Rust record:
+
+```sh
+cargo build --release --example generate_tracepoint
+sudo ./target/release/examples/generate_tracepoint \
+  sched sched_switch target/generated
+
+clang -target bpfel -mcpu=v3 -O2 -I examples/bpf \
+  -c target/generated/sched_sched_switch.bpf.c \
+  -o target/generated/sched_sched_switch.bpf.o
+```
+
+The generator includes a timestamp and CPU, maps fixed scalars and arrays from
+their kernel-provided offsets, calculates a power-of-two lane capacity within a
+64 MiB total transport budget, and emits `mold_record!` code. It deliberately
+rejects pointers and `__data_loc` fields because those need an explicit bounded
+read policy like the pathname policy in the `openat` example.
+
 ### Reproducible transport comparison
 
 `benches/transport_comparison.py` runs alternating paired trials against Aya,

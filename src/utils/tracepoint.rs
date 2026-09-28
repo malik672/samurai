@@ -25,17 +25,7 @@ impl TracepointResolver {
     }
 
     pub fn open(&self, category: &str, name: &str) -> io::Result<Tracepoint> {
-        let tracing_root = self
-            .root
-            .get_or_init(tracing_root)
-            .as_ref()
-            .map_err(|err| io::Error::new(err.kind(), err.to_string()))?;
-
-        let path = tracing_root
-            .join("events")
-            .join(category)
-            .join(name)
-            .join("id");
+        let path = self.event_path(category, name)?.join("id");
 
         let id = fs::File::open(&path)
             .and_then(read_id)
@@ -47,6 +37,33 @@ impl TracepointResolver {
             id,
         })
     }
+
+    pub fn format(&self, category: &str, name: &str) -> io::Result<String> {
+        let path = self.event_path(category, name)?.join("format");
+        fs::read_to_string(&path).map_err(|err| path_error(&path, err))
+    }
+
+    fn event_path(&self, category: &str, name: &str) -> io::Result<std::path::PathBuf> {
+        if !valid_component(category) || !valid_component(name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "tracepoint category and name must contain only ASCII letters, digits, or underscores",
+            ));
+        }
+        let tracing_root = self
+            .root
+            .get_or_init(tracing_root)
+            .as_ref()
+            .map_err(|err| io::Error::new(err.kind(), err.to_string()))?;
+        Ok(tracing_root.join("events").join(category).join(name))
+    }
+}
+
+fn valid_component(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 fn read_id(mut reader: impl Read) -> io::Result<u64> {
@@ -186,6 +203,17 @@ mod tests {
             assert_eq!(
                 read_id(input).unwrap_err().kind(),
                 io::ErrorKind::InvalidData
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_tracepoint_path_components() {
+        let resolver = TracepointResolver::new();
+        for value in ["", ".", "..", "sched/x", "sched-switch"] {
+            assert_eq!(
+                resolver.event_path(value, "event").unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
             );
         }
     }

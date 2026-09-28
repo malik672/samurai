@@ -1,0 +1,363 @@
+//! Generate fixed Mold schemas from Linux tracepoint format descriptions.
+use std::{fmt::Write as _, io};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TracepointField {
+    pub declaration: String,
+    pub name: String,
+    pub offset: usize,
+    pub size: usize,
+    pub signed: bool,
+    pub array_len: Option<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeneratedTracepoint {
+    pub rust: String,
+    pub bpf_c: String,
+    pub words: usize,
+    pub capacity: usize,
+}
+
+pub fn parse_format(format: &str) -> io::Result<Vec<TracepointField>> {
+    format
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("field:"))
+        .map(parse_field)
+        .collect()
+}
+
+pub fn generate(category: &str, event: &str, format: &str) -> io::Result<GeneratedTracepoint> {
+    validate_identifier(category, "category")?;
+    validate_identifier(event, "event")?;
+    let fields: Vec<_> = parse_format(format)?
+        .into_iter()
+        .filter(|field| !field.name.starts_with("common_"))
+        .collect();
+    if fields.is_empty() {
+        return Err(invalid("tracepoint has no event-specific fields"));
+    }
+    for field in &fields {
+        if field.declaration.contains('*')
+            || field.declaration.contains("__data_loc")
+            || field.declaration.contains("__rel_loc")
+            || field.declaration.contains("[]")
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "field {} requires an explicit pointer or dynamic-data policy ({})",
+                    field.name, field.declaration
+                ),
+            ));
+        }
+        if field.array_len.is_none() && !matches!(field.size, 1 | 2 | 4 | 8) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "field {} has unsupported scalar size {}",
+                    field.name, field.size
+                ),
+            ));
+        }
+    }
+
+    let words = 2 + fields.iter().map(field_words).sum::<usize>();
+    if words * 8 > 384 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "generated {}-byte record exceeds the 384-byte BPF stack budget",
+                words * 8
+            ),
+        ));
+    }
+    let slot_size = 16 + words * 8;
+    let per_lane_budget = (64usize << 20) / 8;
+    let capacity = previous_power_of_two(per_lane_budget / slot_size).max(1);
+    let type_name = pascal_case(&format!("{category}_{event}"));
+    let function_name = format!("record_{category}_{event}");
+
+    let mut rust = String::new();
+    writeln!(
+        rust,
+        "// Generated from {category}:{event}; do not edit by hand."
+    )
+    .unwrap();
+    writeln!(rust, "#[derive(Clone, Copy, Debug, Eq, PartialEq)]").unwrap();
+    writeln!(rust, "pub struct {type_name} {{").unwrap();
+    writeln!(rust, "    pub mold_timestamp_ns: u64,").unwrap();
+    writeln!(rust, "    pub mold_cpu: u32,").unwrap();
+    for field in &fields {
+        writeln!(
+            rust,
+            "    pub {}: {},",
+            rust_name(&field.name),
+            rust_type(field)
+        )
+        .unwrap();
+    }
+    writeln!(rust, "}}\n").unwrap();
+    writeln!(rust, "samurai::mold_record!({type_name}, {words} {{").unwrap();
+    writeln!(rust, "    mold_timestamp_ns: u64,").unwrap();
+    writeln!(rust, "    mold_cpu: u32,").unwrap();
+    for field in &fields {
+        writeln!(
+            rust,
+            "    {}: {},",
+            rust_name(&field.name),
+            rust_type(field)
+        )
+        .unwrap();
+    }
+    writeln!(rust, "}});").unwrap();
+
+    let mut bpf_c = String::new();
+    writeln!(
+        bpf_c,
+        "/* Generated from {category}:{event}; do not edit by hand. */"
+    )
+    .unwrap();
+    writeln!(bpf_c, "#define MOLD_WORDS {words}").unwrap();
+    writeln!(bpf_c, "#define MOLD_CAPACITY {capacity}").unwrap();
+    writeln!(bpf_c, "#include \"mold.h\"\n").unwrap();
+    writeln!(bpf_c, "static u64 (*const ktime_get_ns)(void) = (void *)5;").unwrap();
+    writeln!(
+        bpf_c,
+        "static u64 (*const get_smp_processor_id)(void) = (void *)8;\n"
+    )
+    .unwrap();
+    writeln!(
+        bpf_c,
+        "__attribute__((section(\"tracepoint/{category}/{event}\"), used))"
+    )
+    .unwrap();
+    writeln!(bpf_c, "int {function_name}(void *ctx) {{").unwrap();
+    writeln!(bpf_c, "    u32 cpu = (u32)get_smp_processor_id();").unwrap();
+    writeln!(bpf_c, "    u64 words[MOLD_WORDS] = {{}};").unwrap();
+    writeln!(bpf_c, "    words[0] = ktime_get_ns();").unwrap();
+    writeln!(bpf_c, "    words[1] = cpu;").unwrap();
+    let mut word = 2;
+    for field in &fields {
+        writeln!(bpf_c, "    /* {} */", field.declaration).unwrap();
+        if field.array_len.is_some() {
+            writeln!(
+                bpf_c,
+                "    __builtin_memcpy(&words[{word}], (const char *)ctx + {}, {});",
+                field.offset, field.size
+            )
+            .unwrap();
+        } else {
+            writeln!(
+                bpf_c,
+                "    words[{word}] = (u64)({})*(const {} *)((const char *)ctx + {});",
+                if field.signed {
+                    "long long"
+                } else {
+                    "unsigned long long"
+                },
+                c_type(field),
+                field.offset
+            )
+            .unwrap();
+        }
+        word += field_words(field);
+    }
+    writeln!(bpf_c, "    mold_publish(cpu, words);").unwrap();
+    writeln!(bpf_c, "    return 0;").unwrap();
+    writeln!(bpf_c, "}}\n").unwrap();
+    writeln!(bpf_c, "__attribute__((section(\"license\"), used))").unwrap();
+    writeln!(bpf_c, "char program_license[] = \"GPL\";").unwrap();
+
+    Ok(GeneratedTracepoint {
+        rust,
+        bpf_c,
+        words,
+        capacity,
+    })
+}
+
+fn parse_field(line: &str) -> io::Result<TracepointField> {
+    let mut parts = line.split(';');
+    let declaration = parts
+        .next()
+        .and_then(|part| part.strip_prefix("field:"))
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .ok_or_else(|| invalid("missing field declaration"))?;
+    let offset = property(&mut parts, "offset")?;
+    let size = property(&mut parts, "size")?;
+    let signed = property(&mut parts, "signed")? != 0;
+    if size == 0 {
+        return Err(invalid("zero-sized tracepoint field"));
+    }
+    let token = declaration
+        .split_whitespace()
+        .last()
+        .ok_or_else(|| invalid("field has no name"))?;
+    let (name, array_len) = match token.split_once('[') {
+        Some((name, length)) => {
+            let length = length
+                .strip_suffix(']')
+                .ok_or_else(|| invalid("malformed array field"))?;
+            if length.is_empty() {
+                (name, None)
+            } else {
+                let length = length
+                    .parse()
+                    .map_err(|_| invalid("invalid array length"))?;
+                (name, Some(length))
+            }
+        }
+        None => (token.trim_start_matches('*'), None),
+    };
+    validate_identifier(name, "field name")?;
+    Ok(TracepointField {
+        declaration: declaration.to_owned(),
+        name: name.to_owned(),
+        offset,
+        size,
+        signed,
+        array_len,
+    })
+}
+
+fn property<'a>(parts: &mut impl Iterator<Item = &'a str>, name: &str) -> io::Result<usize> {
+    let part = parts
+        .next()
+        .ok_or_else(|| invalid(format!("missing {name}")))?;
+    let (actual, value) = part
+        .trim()
+        .split_once(':')
+        .ok_or_else(|| invalid(format!("malformed {name}")))?;
+    if actual != name {
+        return Err(invalid(format!("expected {name}, found {actual}")));
+    }
+    value
+        .parse()
+        .map_err(|_| invalid(format!("invalid {name}")))
+}
+
+fn field_words(field: &TracepointField) -> usize {
+    if field.array_len.is_some() {
+        field.size.div_ceil(8)
+    } else {
+        1
+    }
+}
+
+fn rust_type(field: &TracepointField) -> String {
+    if field.array_len.is_some() {
+        format!("[u8; {}]", field.size)
+    } else {
+        format!("{}{}", if field.signed { 'i' } else { 'u' }, field.size * 8)
+    }
+}
+
+fn c_type(field: &TracepointField) -> &'static str {
+    match (field.signed, field.size) {
+        (true, 1) => "signed char",
+        (false, 1) => "unsigned char",
+        (true, 2) => "signed short",
+        (false, 2) => "unsigned short",
+        (true, 4) => "signed int",
+        (false, 4) => "unsigned int",
+        (true, 8) => "signed long long",
+        (false, 8) => "unsigned long long",
+        _ => unreachable!(),
+    }
+}
+
+fn rust_name(name: &str) -> String {
+    const KEYWORDS: &[&str] = &[
+        "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn",
+        "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
+        "return", "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe",
+        "use", "where", "while", "async", "await", "dyn",
+    ];
+    if KEYWORDS.contains(&name) {
+        format!("field_{name}")
+    } else {
+        name.to_owned()
+    }
+}
+
+fn pascal_case(value: &str) -> String {
+    value
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            chars
+                .next()
+                .map(char::to_uppercase)
+                .into_iter()
+                .flatten()
+                .chain(chars)
+                .collect::<String>()
+        })
+        .collect()
+}
+
+fn previous_power_of_two(value: usize) -> usize {
+    if value == 0 {
+        0
+    } else {
+        1usize << (usize::BITS - 1 - value.leading_zeros())
+    }
+}
+
+fn validate_identifier(value: &str, description: &str) -> io::Result<()> {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        || value.as_bytes()[0].is_ascii_digit()
+    {
+        return Err(invalid(format!("invalid {description}: {value:?}")));
+    }
+    Ok(())
+}
+
+fn invalid(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SCHED_SWITCH: &str = r#"name: sched_switch
+ID: 252
+format:
+ field:unsigned short common_type; offset:0; size:2; signed:0;
+ field:char prev_comm[16]; offset:8; size:16; signed:0;
+ field:pid_t prev_pid; offset:24; size:4; signed:1;
+ field:long prev_state; offset:32; size:8; signed:1;
+ field:char next_comm[16]; offset:40; size:16; signed:0;
+ field:pid_t next_pid; offset:56; size:4; signed:1;
+"#;
+
+    #[test]
+    fn parses_and_generates_fixed_sched_fields() {
+        let generated = generate("sched", "sched_switch", SCHED_SWITCH).unwrap();
+        assert_eq!(generated.words, 9);
+        assert!(generated.rust.contains("pub prev_comm: [u8; 16]"));
+        assert!(!generated.rust.contains("pub previous_state"));
+        assert!(generated.rust.contains("pub prev_state: i64"));
+        assert!(generated.bpf_c.contains("tracepoint/sched/sched_switch"));
+        assert!(generated.bpf_c.contains("(const char *)ctx + 56"));
+    }
+
+    #[test]
+    fn rejects_pointer_and_dynamic_fields() {
+        for declaration in ["const char * filename", "__data_loc char[] name"] {
+            let format = format!("field:{declaration}; offset:16; size:8; signed:0;");
+            assert_eq!(
+                generate("x", "y", &format).unwrap_err().kind(),
+                io::ErrorKind::Unsupported
+            );
+        }
+    }
+}
