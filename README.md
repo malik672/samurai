@@ -151,7 +151,7 @@ empty-string, and invalid-pointer cases and verifies them through Mold:
 
 ```sh
 clang -target bpfel -mcpu=v3 -O2 -I examples/bpf \
-  -DMOLD_CAPACITY=1024 -DOPENAT_TARGET_PID \
+  -DMOLD_CAPACITY=1024 \
   -c examples/bpf/openat.c \
   -o target/openat-helper-test.bpf.o
 cargo build --release --example openat_helper_test

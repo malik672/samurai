@@ -19,10 +19,7 @@ fn main() -> io::Result<()> {
         )
     })?;
     let loaded = ObjectLoader::from_file(object)?.load()?;
-    loaded
-        .map("target")
-        .ok_or_else(|| missing("target"))?
-        .write(0, &std::process::id().to_ne_bytes())?;
+    let wanted_pid = std::process::id();
     let slots = loaded
         .map("slots")
         .ok_or_else(|| missing("slots"))?
@@ -54,7 +51,9 @@ fn main() -> io::Result<()> {
         for worker in &mut workers {
             match worker.try_next_record::<OpenAtRecord>()? {
                 Some(TypedMoldEntry::Data(record)) => {
-                    records.push(record);
+                    if record.pid == wanted_pid {
+                        records.push(record);
+                    }
                     progressed = true;
                 }
                 Some(TypedMoldEntry::Gap(missed)) => {

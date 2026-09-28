@@ -9,11 +9,6 @@ static u64 (*const get_current_pid_tgid)(void) = (void *)14;
 static u64 (*const get_smp_processor_id)(void) = (void *)8;
 static long (*const probe_read_user_str)(void *, u32, const void *) = (void *)114;
 
-#ifdef OPENAT_TARGET_PID
-__attribute__((section("maps"), used))
-struct map_def target = {2, sizeof(u32), sizeof(u32), 1, 0};
-#endif
-
 struct sys_enter {
     u64 common;
     long syscall_number;
@@ -23,11 +18,6 @@ struct sys_enter {
 __attribute__((section("tracepoint/syscalls/sys_enter_openat"), used))
 int record_openat(struct sys_enter *ctx) {
     u64 pid_tgid = get_current_pid_tgid();
-#ifdef OPENAT_TARGET_PID
-    u32 zero = 0;
-    u32 *wanted = map_lookup_elem(&target, &zero);
-    if (!wanted || *wanted != (u32)(pid_tgid >> 32)) return 0;
-#endif
     u32 cpu = (u32)get_smp_processor_id();
     u64 words[MOLD_WORDS] = {};
     words[0] = ktime_get_ns();
