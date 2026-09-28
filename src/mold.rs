@@ -1,8 +1,12 @@
 //! Molded streaming with generation marks.
+use crate::bpf::map::MappedArray;
+use std::io;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
+
+const CONSUMER_MARK_INTERVAL: u64 = 128;
 
 const WRITING: u64 = 1 << 63;
 const DATA: u64 = 0;
@@ -34,6 +38,37 @@ pub struct MoldWorker<const WORDS: usize> {
     lane: Arc<Lane<WORDS>>,
     expected_mark: u64,
     done: bool,
+}
+
+#[repr(C)]
+struct MappedSlot<const WORDS: usize> {
+    mark: AtomicU64,
+    kind: u64,
+    words: [u64; WORDS],
+}
+
+#[repr(C)]
+struct MappedFrontier {
+    producer_mark: AtomicU64,
+    _producer_padding: [u64; 7],
+    consumer_mark: AtomicU64,
+    _consumer_padding: [u64; 7],
+}
+
+/// Validated mmap view of the fixed Mold maps created by a BPF program.
+pub struct MappedMold<'map, const WORDS: usize> {
+    slots: &'map MappedArray<'map>,
+    frontiers: &'map MappedArray<'map>,
+    lanes: usize,
+    capacity: usize,
+}
+
+/// One userspace cursor over one CPU-owned BPF lane.
+pub struct MappedMoldWorker<'mold, 'map, const WORDS: usize> {
+    mold: &'mold MappedMold<'map, WORDS>,
+    lane: usize,
+    expected_mark: u64,
+    consumed_since_publish: u64,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -138,6 +173,148 @@ pub fn marked_mold<const WORDS: usize>(
             done: false,
         },
     ))
+}
+
+impl<'map, const WORDS: usize> MappedMold<'map, WORDS> {
+    pub fn new(
+        slots: &'map MappedArray<'map>,
+        frontiers: &'map MappedArray<'map>,
+    ) -> io::Result<Self> {
+        if WORDS == 0
+            || slots.value_size() != size_of::<MappedSlot<WORDS>>()
+            || frontiers.value_size() != size_of::<MappedFrontier>()
+            || frontiers.entries() == 0
+            || !slots.entries().is_multiple_of(frontiers.entries())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid mapped Mold ABI",
+            ));
+        }
+        let capacity = slots.entries() / frontiers.entries();
+        if capacity == 0 || !capacity.is_power_of_two() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Mold lane capacity must be a non-zero power of two",
+            ));
+        }
+        Ok(Self {
+            slots,
+            frontiers,
+            lanes: frontiers.entries(),
+            capacity,
+        })
+    }
+
+    pub fn lanes(&self) -> usize {
+        self.lanes
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn worker(&self, lane: usize) -> io::Result<MappedMoldWorker<'_, 'map, WORDS>> {
+        if lane >= self.lanes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Mold lane index out of range",
+            ));
+        }
+        Ok(MappedMoldWorker {
+            mold: self,
+            lane,
+            expected_mark: 1,
+            consumed_since_publish: 0,
+        })
+    }
+}
+
+impl<const WORDS: usize> MappedMoldWorker<'_, '_, WORDS> {
+    pub fn try_next(&mut self) -> io::Result<Option<MoldEntry<WORDS>>> {
+        let producer_mark = self.frontier()?.producer_mark.load(Ordering::Acquire);
+        if self.expected_mark > producer_mark {
+            return Ok(None);
+        }
+        let oldest_mark = producer_mark
+            .saturating_sub(self.mold.capacity as u64 - 1)
+            .max(1);
+        if self.expected_mark < oldest_mark {
+            let missed = oldest_mark - self.expected_mark;
+            self.expected_mark = oldest_mark;
+            self.publish_progress()?;
+            return Ok(Some(MoldEntry::Gap(missed)));
+        }
+
+        let index = self.lane * self.mold.capacity
+            + ((self.expected_mark - 1) & (self.mold.capacity as u64 - 1)) as usize;
+        let slot = self
+            .mold
+            .slots
+            .value_ptr(index)?
+            .cast::<MappedSlot<WORDS>>();
+        let slot = unsafe { slot.as_ref() };
+        let first_mark = slot.mark.load(Ordering::Acquire);
+        if first_mark != self.expected_mark {
+            return Ok(None);
+        }
+        let words = unsafe { std::ptr::read_volatile(&raw const slot.words) };
+        let kind = unsafe { std::ptr::read_volatile(&raw const slot.kind) };
+        std::sync::atomic::fence(Ordering::Acquire);
+        if slot.mark.load(Ordering::Acquire) != first_mark {
+            return Ok(None);
+        }
+
+        self.expected_mark += 1;
+        self.consumed_since_publish += 1;
+        if self.consumed_since_publish == CONSUMER_MARK_INTERVAL {
+            self.publish_progress()?;
+        }
+        match kind {
+            DATA => Ok(Some(MoldEntry::Data(words))),
+            DONE => Ok(Some(MoldEntry::Done)),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid mapped Mold entry kind",
+            )),
+        }
+    }
+
+    pub fn try_next_record<Record: MoldRecord<WORDS>>(
+        &mut self,
+    ) -> io::Result<Option<TypedMoldEntry<Record>>> {
+        Ok(self.try_next()?.map(|entry| match entry {
+            MoldEntry::Data(words) => TypedMoldEntry::Data(Record::decode(words)),
+            MoldEntry::Gap(missed) => TypedMoldEntry::Gap(missed),
+            MoldEntry::Done => TypedMoldEntry::Done,
+        }))
+    }
+
+    pub fn is_caught_up(&self) -> io::Result<bool> {
+        Ok(self.expected_mark > self.frontier()?.producer_mark.load(Ordering::Acquire))
+    }
+
+    pub fn publish_consumer_mark(&mut self) -> io::Result<()> {
+        self.publish_progress()
+    }
+
+    fn frontier(&self) -> io::Result<&MappedFrontier> {
+        let frontier = self
+            .mold
+            .frontiers
+            .value_ptr(self.lane)?
+            .cast::<MappedFrontier>();
+        Ok(unsafe { frontier.as_ref() })
+    }
+
+    fn publish_progress(&mut self) -> io::Result<()> {
+        let consumer_mark = self.expected_mark - 1;
+        self.consumed_since_publish = 0;
+        self.frontier()?
+            .consumer_mark
+            .store(consumer_mark, Ordering::Release);
+        Ok(())
+    }
 }
 
 impl<const WORDS: usize> MoldProducer<WORDS> {
@@ -339,6 +516,24 @@ mod tests {
         assert_eq!(
             worker.try_next_record::<crate::record::ContextSwitchRecord>(),
             Some(TypedMoldEntry::Done)
+        );
+    }
+
+    #[test]
+    fn openat_schema_preserves_signed_arguments() {
+        use super::MoldRecord;
+        let record = crate::record::OpenAtRecord {
+            timestamp_ns: 10,
+            pid: 20,
+            cpu: 3,
+            directory_fd: -100,
+            flags: i32::MIN,
+            mode: 0o640,
+        };
+        let words = <crate::record::OpenAtRecord as MoldRecord<6>>::encode(record);
+        assert_eq!(
+            <crate::record::OpenAtRecord as MoldRecord<6>>::decode(words),
+            record
         );
     }
 }

@@ -130,6 +130,20 @@ another fixed-size event requires its Rust record and schema declaration plus a
 BPF handler that writes fields in the declared order. The lane, mark, gap, and
 retention protocol remains unchanged.
 
+`openat` is the second complete event implementation and uses the library's
+generic mapped-lane reader:
+
+```sh
+clang -target bpfel -mcpu=v3 -O2 -I examples/bpf \
+  -c examples/bpf/openat.c \
+  -o target/openat.bpf.o
+cargo build --release --example openat
+sudo ./target/release/examples/openat target/openat.bpf.o 5
+```
+
+The example attaches to `syscalls:sys_enter_openat`, reads every CPU lane as
+typed `OpenAtRecord` values, prints a bounded sample, and reports exact gaps.
+
 ### Reproducible transport comparison
 
 `benches/transport_comparison.py` runs alternating paired trials against Aya,

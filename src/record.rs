@@ -29,6 +29,25 @@ crate::mold_record!(ContextSwitchRecord, 6 {
     previous_state: i64,
 });
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OpenAtRecord {
+    pub timestamp_ns: u64,
+    pub pid: u32,
+    pub cpu: u32,
+    pub directory_fd: i32,
+    pub flags: i32,
+    pub mode: u32,
+}
+
+crate::mold_record!(OpenAtRecord, 6 {
+    timestamp_ns: u64,
+    pid: u32,
+    cpu: u32,
+    directory_fd: i32,
+    flags: i32,
+    mode: u32,
+});
+
 pub struct RingBufferRecorder<'map> {
     map: &'map RingBufferMap,
     consumer_mapping: NonNull<libc::c_void>,
