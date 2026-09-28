@@ -7,7 +7,7 @@ use samurai::{
     record::OpenAtRecord,
     utils::tracepoint::TracepointResolver,
 };
-use std::{ffi::CString, io};
+use std::{collections::BTreeMap, ffi::CString, io};
 
 const WORDS: usize = 16;
 
@@ -45,12 +45,14 @@ fn main() -> io::Result<()> {
     drop(attachment);
 
     let mut records = Vec::new();
+    let mut observed_pids = BTreeMap::<u32, usize>::new();
     let mut gaps = 0;
     loop {
         let mut progressed = false;
         for worker in &mut workers {
             match worker.try_next_record::<OpenAtRecord>()? {
                 Some(TypedMoldEntry::Data(record)) => {
+                    *observed_pids.entry(record.pid).or_default() += 1;
                     if record.pid == wanted_pid {
                         records.push(record);
                     }
@@ -80,7 +82,7 @@ fn main() -> io::Result<()> {
     assert_eq!(
         records.len(),
         4,
-        "expected exactly four targeted openat calls"
+        "expected exactly four openat calls for pid {wanted_pid}; observed records by pid: {observed_pids:?}"
     );
     assert_eq!(records[0].path_bytes(), b"/dev/null");
     assert_eq!(records[0].path_error, 0);
