@@ -1,0 +1,15 @@
+[package]
+name = "samurai"
+version = "0.1.0"
+edition = "2024"
+autobenches = false
+license = "MIT"
+
+[[bench]]
+name = "tracepoint_read"
+path = "benches/tracepoint_read.rs"
+
+[dependencies]
+aya-obj = "0.3"
+libc = "0.2.189"
+rustc-hash = "2"
