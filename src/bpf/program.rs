@@ -7,6 +7,11 @@ use crate::{perf::event, utils::tracepoint::TracepointResolver};
 use aya_obj::{Function, Program};
 use std::{io, os::fd::OwnedFd};
 
+/// Owns every per-CPU perf event that keeps a tracepoint program attached.
+pub struct TracePointLink {
+    _perf_fds: Vec<OwnedFd>,
+}
+
 /// A successfully loaded kernel program; no parsed instructions are retained.
 pub struct TracePoint {
     fd: OwnedFd,
@@ -21,17 +26,23 @@ impl TracePoint {
         )?;
         Ok(Self { fd })
     }
-    /// Keep the returned FD alive to retain this CPU's attachment.
+    /// Keep the returned link alive to retain the attachment on every online CPU.
     pub fn attach(
         &self,
         resolver: &TracepointResolver,
         category: &str,
         name: &str,
-    ) -> io::Result<OwnedFd> {
+    ) -> io::Result<TracePointLink> {
         let tracepoint = resolver.open(category, name)?;
-        let perf_fd = event::open_tracepoint(tracepoint.id)?;
-        event::attach_bpf(&perf_fd, &self.fd)?;
-        event::enable_event(&perf_fd)?;
-        Ok(perf_fd)
+        let mut perf_fds = Vec::new();
+        for cpu in event::online_cpus()? {
+            let perf_fd = event::open_tracepoint_on_cpu(tracepoint.id, cpu)?;
+            event::attach_bpf(&perf_fd, &self.fd)?;
+            event::enable_event(&perf_fd)?;
+            perf_fds.push(perf_fd);
+        }
+        Ok(TracePointLink {
+            _perf_fds: perf_fds,
+        })
     }
 }
