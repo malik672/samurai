@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const OPENAT_WORDS: usize = 15;
+const OPENAT_WORDS: usize = 16;
 const SAMPLE_LIMIT: u64 = 20;
 
 fn main() -> io::Result<()> {
@@ -96,11 +96,12 @@ fn drain_once(
                 progressed = true;
                 if *printed < SAMPLE_LIMIT {
                     println!(
-                        "{} CPU {} pid={} openat(path={:?}, dfd={}, flags={:#x}, mode={:#o})",
+                        "{} CPU {} pid={} openat(path={:?}, path_error={}, dfd={}, flags={:#x}, mode={:#o})",
                         record.timestamp_ns,
                         record.cpu,
                         record.pid,
                         String::from_utf8_lossy(record.path_bytes()),
+                        record.path_error,
                         record.directory_fd,
                         record.flags,
                         record.mode,

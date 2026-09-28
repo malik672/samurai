@@ -146,6 +146,22 @@ user-string helper as Aya to capture up to 63 pathname bytes, reads every CPU
 lane as typed `OpenAtRecord` values, and reports exact gaps. Its 64K-slot lanes
 reserve about 72 MiB for the wider path-bearing records.
 
+The privileged helper compatibility test adapts Aya's normal, truncation,
+empty-string, and invalid-pointer cases and verifies them through Mold:
+
+```sh
+clang -target bpfel -mcpu=v3 -O2 -I examples/bpf \
+  -DMOLD_CAPACITY=1024 -DOPENAT_TARGET_PID \
+  -c examples/bpf/openat.c \
+  -o target/openat-helper-test.bpf.o
+cargo build --release --example openat_helper_test
+sudo ./target/release/examples/openat_helper_test \
+  target/openat-helper-test.bpf.o
+```
+
+`OpenAtRecord::path_error` preserves a negative helper result, keeping an empty
+pathname distinct from an unreadable user pointer.
+
 ### Generate a tracepoint schema
 
 Samurai can turn Linux's authoritative tracepoint format into a fixed Mold BPF

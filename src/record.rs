@@ -38,10 +38,11 @@ pub struct OpenAtRecord {
     pub flags: i32,
     pub mode: u32,
     pub path_len: u32,
+    pub path_error: i32,
     pub path: [u8; 64],
 }
 
-crate::mold_record!(OpenAtRecord, 15 {
+crate::mold_record!(OpenAtRecord, 16 {
     timestamp_ns: u64,
     pid: u32,
     cpu: u32,
@@ -49,6 +50,7 @@ crate::mold_record!(OpenAtRecord, 15 {
     flags: i32,
     mode: u32,
     path_len: u32,
+    path_error: i32,
     path: [u8; 64],
 });
 

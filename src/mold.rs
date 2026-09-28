@@ -589,15 +589,16 @@ mod tests {
             flags: i32::MIN,
             mode: 0o640,
             path_len: 8,
+            path_error: 0,
             path: {
                 let mut path = [0; 64];
                 path[..8].copy_from_slice(b"/tmp/log");
                 path
             },
         };
-        let words = <crate::record::OpenAtRecord as MoldRecord<15>>::encode(record);
+        let words = <crate::record::OpenAtRecord as MoldRecord<16>>::encode(record);
         assert_eq!(
-            <crate::record::OpenAtRecord as MoldRecord<15>>::decode(words),
+            <crate::record::OpenAtRecord as MoldRecord<16>>::decode(words),
             record
         );
         assert_eq!(record.path_bytes(), b"/tmp/log");
