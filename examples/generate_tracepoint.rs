@@ -3,27 +3,32 @@ use std::{fs, io, path::PathBuf};
 
 fn main() -> io::Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    let (category, event, output, format) = match args.as_slice() {
-        [category, event, output] => (
-            category,
-            event,
-            PathBuf::from(output),
-            TracepointResolver::new().format(category, event)?,
-        ),
-        [flag, file, category, event, output] if flag == "--format-file" => (
-            category,
-            event,
-            PathBuf::from(output),
-            fs::read_to_string(file)?,
-        ),
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "usage: generate_tracepoint [--format-file <path>] <category> <event> <output-directory>",
-            ));
+    let mut format_file = None;
+    let mut fields = None;
+    let mut position = 0;
+    while position < args.len() && args[position].starts_with("--") {
+        let flag = &args[position];
+        let value = args.get(position + 1).ok_or_else(usage)?;
+        match flag.as_str() {
+            "--format-file" => format_file = Some(value.as_str()),
+            "--fields" => {
+                let selected: Vec<_> = value.split(',').map(str::to_owned).collect();
+                fields = Some(selected);
+            }
+            _ => return Err(usage()),
         }
+        position += 2;
+    }
+    let [category, event, output] = &args[position..] else {
+        return Err(usage());
     };
-    let generated = tracepoint_schema::generate(category, event, &format)?;
+    let output = PathBuf::from(output);
+    let format = match format_file {
+        Some(file) => fs::read_to_string(file)?,
+        None => TracepointResolver::new().format(category, event)?,
+    };
+    let generated =
+        tracepoint_schema::generate_selected(category, event, &format, fields.as_deref())?;
     fs::create_dir_all(&output)?;
     let stem = format!("{category}_{event}");
     let rust = output.join(format!("{stem}.rs"));
@@ -39,4 +44,11 @@ fn main() -> io::Result<()> {
         bpf.display(),
     );
     Ok(())
+}
+
+fn usage() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "usage: generate_tracepoint [--format-file <path>] [--fields <a,b,...>] <category> <event> <output-directory>",
+    )
 }

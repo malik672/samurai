@@ -162,6 +162,17 @@ clang -target bpfel -mcpu=v3 -O2 -I examples/bpf \
   -o target/generated/sched_sched_switch.bpf.o
 ```
 
+Select only the fields needed by the profiler to shrink each slot and increase
+retention within the same memory budget:
+
+```sh
+sudo cat /sys/kernel/tracing/events/sched/sched_switch/format |
+  ./target/release/examples/generate_tracepoint \
+    --format-file /dev/stdin \
+    --fields prev_pid,next_pid,prev_state \
+    sched sched_switch target/generated-minimal
+```
+
 The generator includes a timestamp and CPU, maps fixed scalars and arrays from
 their kernel-provided offsets, calculates a power-of-two lane capacity within a
 64 MiB total transport budget, and emits `mold_record!` code. It deliberately

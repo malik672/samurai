@@ -1,5 +1,5 @@
 //! Generate fixed Mold schemas from Linux tracepoint format descriptions.
-use std::{fmt::Write as _, io};
+use std::{collections::HashSet, fmt::Write as _, io};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TracepointField {
@@ -29,12 +29,25 @@ pub fn parse_format(format: &str) -> io::Result<Vec<TracepointField>> {
 }
 
 pub fn generate(category: &str, event: &str, format: &str) -> io::Result<GeneratedTracepoint> {
+    generate_selected(category, event, format, None)
+}
+
+pub fn generate_selected(
+    category: &str,
+    event: &str,
+    format: &str,
+    selected: Option<&[String]>,
+) -> io::Result<GeneratedTracepoint> {
     validate_identifier(category, "category")?;
     validate_identifier(event, "event")?;
-    let fields: Vec<_> = parse_format(format)?
+    let available: Vec<_> = parse_format(format)?
         .into_iter()
         .filter(|field| !field.name.starts_with("common_"))
         .collect();
+    let fields = match selected {
+        Some(selected) => select_fields(&available, selected)?,
+        None => available,
+    };
     if fields.is_empty() {
         return Err(invalid("tracepoint has no event-specific fields"));
     }
@@ -176,6 +189,30 @@ pub fn generate(category: &str, event: &str, format: &str) -> io::Result<Generat
         words,
         capacity,
     })
+}
+
+fn select_fields(
+    available: &[TracepointField],
+    selected: &[String],
+) -> io::Result<Vec<TracepointField>> {
+    if selected.is_empty() {
+        return Err(invalid("field selection cannot be empty"));
+    }
+    let mut seen = HashSet::new();
+    selected
+        .iter()
+        .map(|name| {
+            validate_identifier(name, "selected field")?;
+            if !seen.insert(name.as_str()) {
+                return Err(invalid(format!("field {name} was selected more than once")));
+            }
+            available
+                .iter()
+                .find(|field| field.name == *name)
+                .cloned()
+                .ok_or_else(|| invalid(format!("tracepoint has no field named {name}")))
+        })
+        .collect()
 }
 
 fn parse_field(line: &str) -> io::Result<TracepointField> {
@@ -327,6 +364,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{fs, process::Command, time::SystemTime};
 
     const SCHED_SWITCH: &str = r#"name: sched_switch
 ID: 252
@@ -348,6 +386,37 @@ format:
         assert!(generated.rust.contains("pub prev_state: i64"));
         assert!(generated.bpf_c.contains("tracepoint/sched/sched_switch"));
         assert!(generated.bpf_c.contains("(const char *)ctx + 56"));
+        compile_generated_rust(&generated.rust);
+    }
+
+    #[test]
+    fn selection_reduces_record_and_preserves_requested_order() {
+        let selected = ["next_pid".to_owned(), "prev_pid".to_owned()];
+        let generated =
+            generate_selected("sched", "sched_switch", SCHED_SWITCH, Some(&selected)).unwrap();
+        assert_eq!(generated.words, 4);
+        assert!(!generated.rust.contains("prev_comm"));
+        assert!(
+            generated.rust.find("next_pid").unwrap() < generated.rust.find("prev_pid").unwrap()
+        );
+        assert!(generated.bpf_c.contains("(const char *)ctx + 56"));
+        assert!(generated.bpf_c.contains("(const char *)ctx + 24"));
+        compile_generated_rust(&generated.rust);
+    }
+
+    #[test]
+    fn selection_rejects_unknown_and_duplicate_fields() {
+        for selected in [
+            vec!["missing".to_owned()],
+            vec!["prev_pid".to_owned(), "prev_pid".to_owned()],
+        ] {
+            assert_eq!(
+                generate_selected("sched", "sched_switch", SCHED_SWITCH, Some(&selected))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
     }
 
     #[test]
@@ -359,5 +428,55 @@ format:
                 io::ErrorKind::Unsupported
             );
         }
+    }
+
+    fn compile_generated_rust(source: &str) {
+        let dependencies = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_owned();
+        let rlib = fs::read_dir(&dependencies)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("libsamurai-") && name.ends_with(".rlib")
+            })
+            .max_by_key(|entry| {
+                entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .unwrap_or(SystemTime::UNIX_EPOCH)
+            })
+            .expect("Cargo must build the Samurai rlib before its unit tests");
+        let directory = dependencies.join(format!("schema-test-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let input = directory.join("generated.rs");
+        let output = directory.join("libgenerated.rlib");
+        fs::write(&input, source).unwrap();
+        let result = Command::new("rustc")
+            .args([
+                "--crate-name",
+                "generated_schema",
+                "--crate-type",
+                "lib",
+                "--edition=2024",
+            ])
+            .arg(&input)
+            .arg("--extern")
+            .arg(format!("samurai={}", rlib.path().display()))
+            .arg("-L")
+            .arg(format!("dependency={}", dependencies.display()))
+            .arg("-o")
+            .arg(output)
+            .output()
+            .expect("generated Rust schema requires rustc");
+        assert!(
+            result.status.success(),
+            "generated Rust failed to compile:\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
 }
