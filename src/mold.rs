@@ -97,6 +97,55 @@ pub trait MoldWord: Sized {
     fn from_mold_word(word: u64) -> Self;
 }
 
+/// A field occupying one or more consecutive words in a Mold schema.
+pub trait MoldField: Sized {
+    const WORDS: usize;
+    fn encode_field(self, output: &mut [u64], offset: &mut usize);
+    fn decode_field(input: &[u64], offset: &mut usize) -> Self;
+}
+
+impl<Word: MoldWord> MoldField for Word {
+    const WORDS: usize = 1;
+
+    #[inline]
+    fn encode_field(self, output: &mut [u64], offset: &mut usize) {
+        output[*offset] = self.into_mold_word();
+        *offset += 1;
+    }
+
+    #[inline]
+    fn decode_field(input: &[u64], offset: &mut usize) -> Self {
+        let value = Self::from_mold_word(input[*offset]);
+        *offset += 1;
+        value
+    }
+}
+
+impl<const BYTES: usize> MoldField for [u8; BYTES] {
+    const WORDS: usize = BYTES.div_ceil(8);
+
+    #[inline]
+    fn encode_field(self, output: &mut [u64], offset: &mut usize) {
+        for (index, chunk) in self.chunks(8).enumerate() {
+            let mut bytes = [0; 8];
+            bytes[..chunk.len()].copy_from_slice(chunk);
+            output[*offset + index] = u64::from_ne_bytes(bytes);
+        }
+        *offset += Self::WORDS;
+    }
+
+    #[inline]
+    fn decode_field(input: &[u64], offset: &mut usize) -> Self {
+        let mut output = [0; BYTES];
+        for (index, chunk) in output.chunks_mut(8).enumerate() {
+            let bytes = input[*offset + index].to_ne_bytes();
+            chunk.copy_from_slice(&bytes[..chunk.len()]);
+        }
+        *offset += Self::WORDS;
+        output
+    }
+}
+
 macro_rules! mold_words {
     ($($type:ty),+ $(,)?) => {$ (
         impl MoldWord for $type {
@@ -117,20 +166,30 @@ mold_words!(u8, u16, u32, u64, i8, i16, i32, i64);
 #[macro_export]
 macro_rules! mold_record {
     ($record:ty, $words:literal { $($field:ident : $field_type:ty),+ $(,)? }) => {
+        const _: () = assert!(
+            $words == 0 $(+ <$field_type as $crate::mold::MoldField>::WORDS)+
+        );
+
         impl $crate::mold::MoldRecord<$words> for $record {
             #[inline]
             fn encode(self) -> [u64; $words] {
-                [$(
-                    <$field_type as $crate::mold::MoldWord>::into_mold_word(self.$field)
-                ),+]
+                let mut output = [0; $words];
+                let mut offset = 0;
+                $(<$field_type as $crate::mold::MoldField>::encode_field(
+                    self.$field,
+                    &mut output,
+                    &mut offset,
+                );)+
+                output
             }
 
             #[inline]
             fn decode(words: [u64; $words]) -> Self {
-                let mut words = words.into_iter();
+                let mut offset = 0;
                 Self {
-                    $($field: <$field_type as $crate::mold::MoldWord>::from_mold_word(
-                        words.next().expect("Mold schema word count must match its fields"),
+                    $($field: <$field_type as $crate::mold::MoldField>::decode_field(
+                        &words,
+                        &mut offset,
                     )),+
                 }
             }
@@ -529,11 +588,18 @@ mod tests {
             directory_fd: -100,
             flags: i32::MIN,
             mode: 0o640,
+            path_len: 8,
+            path: {
+                let mut path = [0; 64];
+                path[..8].copy_from_slice(b"/tmp/log");
+                path
+            },
         };
-        let words = <crate::record::OpenAtRecord as MoldRecord<6>>::encode(record);
+        let words = <crate::record::OpenAtRecord as MoldRecord<15>>::encode(record);
         assert_eq!(
-            <crate::record::OpenAtRecord as MoldRecord<6>>::decode(words),
+            <crate::record::OpenAtRecord as MoldRecord<15>>::decode(words),
             record
         );
+        assert_eq!(record.path_bytes(), b"/tmp/log");
     }
 }

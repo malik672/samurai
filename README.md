@@ -141,8 +141,10 @@ cargo build --release --example openat
 sudo ./target/release/examples/openat target/openat.bpf.o 5
 ```
 
-The example attaches to `syscalls:sys_enter_openat`, reads every CPU lane as
-typed `OpenAtRecord` values, prints a bounded sample, and reports exact gaps.
+The example attaches to `syscalls:sys_enter_openat`, uses the same bounded
+user-string helper as Aya to capture up to 63 pathname bytes, reads every CPU
+lane as typed `OpenAtRecord` values, and reports exact gaps. Its 64K-slot lanes
+reserve about 72 MiB for the wider path-bearing records.
 
 ### Reproducible transport comparison
 
