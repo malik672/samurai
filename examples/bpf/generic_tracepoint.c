@@ -6,6 +6,9 @@
 
 #define CAPTURE_OPERATIONS 32
 #define CAPTURE_SIGNED 1U
+#define CAPTURE_DATA_LOC 2U
+#define CAPTURE_RELATIVE 4U
+#define CAPTURE_DYNAMIC_METADATA 8U
 
 static u64 (*const ktime_get_ns)(void) = (void *)5;
 static u64 (*const get_smp_processor_id)(void) = (void *)8;
@@ -16,7 +19,7 @@ struct capture_operation {
     unsigned short size;
     unsigned short destination_word;
     u32 flags;
-    u32 reserved;
+    u32 data_offset;
 };
 
 struct capture_scratch {
@@ -82,6 +85,32 @@ capture_one(void *ctx, u32 index, u64 *captured) {
     if (!operation) return 0;
     u64 value = 0;
     unsigned short size = operation->size;
+    if (operation->flags & CAPTURE_DATA_LOC) {
+        u64 locator_word = 0;
+        if (read_4(ctx, operation->source_offset, &locator_word) < 0)
+            return 0;
+        u32 locator = (u32)locator_word;
+        u32 data_start = locator & 0xffffU;
+        u32 data_length = locator >> 16;
+        if (operation->flags & CAPTURE_RELATIVE)
+            data_start += operation->source_offset;
+        if (operation->flags & CAPTURE_DYNAMIC_METADATA) {
+            u32 captured_length = data_length;
+            if (captured_length > size) captured_length = size;
+            *captured = ((u64)data_length << 32) | captured_length;
+            return 1;
+        }
+        if (operation->data_offset >= data_length) {
+            *captured = 0;
+            return 1;
+        }
+        u32 remaining = data_length - operation->data_offset;
+        if (remaining < size) size = (unsigned short)remaining;
+        if (read_fixed(ctx, data_start + operation->data_offset, size, &value) < 0)
+            return 0;
+        *captured = value;
+        return 1;
+    }
     if (read_fixed(ctx, operation->source_offset, size, &value) < 0)
         return 0;
     if (operation->flags & CAPTURE_SIGNED)

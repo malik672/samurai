@@ -5,6 +5,12 @@ const MOLD_METADATA_WORDS: usize = 2;
 const BPF_STACK_RECORD_BUDGET: usize = 384;
 pub const GENERIC_CAPTURE_WORDS: usize = 34;
 pub const GENERIC_CAPTURE_OPERATIONS: usize = GENERIC_CAPTURE_WORDS - MOLD_METADATA_WORDS;
+pub const DEFAULT_DYNAMIC_CAPTURE_BYTES: usize = 64;
+
+const CAPTURE_SIGNED: u32 = 1 << 0;
+const CAPTURE_DATA_LOC: u32 = 1 << 1;
+const CAPTURE_RELATIVE: u32 = 1 << 2;
+const CAPTURE_DYNAMIC_METADATA: u32 = 1 << 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureKind {
@@ -55,6 +61,8 @@ pub struct CaptureField {
     pub destination_word: usize,
     pub words: usize,
     pub kind: CaptureKind,
+    /// Maximum bytes copied for a dynamic field; zero for fixed fields.
+    pub capture_size: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,7 +70,8 @@ pub struct CaptureOperation {
     pub source_offset: u32,
     pub size: u16,
     pub destination_word: u16,
-    pub signed: bool,
+    pub flags: u32,
+    pub data_offset: u32,
 }
 
 impl CaptureOperation {
@@ -72,7 +81,8 @@ impl CaptureOperation {
         bytes[..4].copy_from_slice(&self.source_offset.to_ne_bytes());
         bytes[4..6].copy_from_slice(&self.size.to_ne_bytes());
         bytes[6..8].copy_from_slice(&self.destination_word.to_ne_bytes());
-        bytes[8..12].copy_from_slice(&u32::from(self.signed).to_ne_bytes());
+        bytes[8..12].copy_from_slice(&self.flags.to_ne_bytes());
+        bytes[12..16].copy_from_slice(&self.data_offset.to_ne_bytes());
         bytes
     }
 }
@@ -85,14 +95,69 @@ impl CapturePlan {
         event: &str,
         selected: Option<&[String]>,
     ) -> io::Result<Self> {
+        Self::discover_bounded(
+            resolver,
+            category,
+            event,
+            selected,
+            DEFAULT_DYNAMIC_CAPTURE_BYTES,
+        )
+    }
+
+    pub fn discover_bounded(
+        resolver: &crate::utils::tracepoint::TracepointResolver,
+        category: &str,
+        event: &str,
+        selected: Option<&[String]>,
+        dynamic_capture_bytes: usize,
+    ) -> io::Result<Self> {
         let format = resolver.format(category, event)?;
-        capture_plan(category, event, &format, selected)
+        capture_plan_bounded(category, event, &format, selected, dynamic_capture_bytes)
     }
 
     /// Lower fields into bounded operations understood by the generic BPF reader.
     pub fn operations(&self) -> io::Result<Vec<CaptureOperation>> {
         let mut operations = Vec::new();
         for field in &self.fields {
+            if matches!(
+                field.kind,
+                CaptureKind::DataLoc | CaptureKind::RelativeDataLoc
+            ) {
+                let dynamic_flags = CAPTURE_DATA_LOC
+                    | if field.kind == CaptureKind::RelativeDataLoc {
+                        CAPTURE_RELATIVE
+                    } else {
+                        0
+                    };
+                operations.push(CaptureOperation {
+                    source_offset: u32::try_from(field.source_offset).map_err(|_| {
+                        io::Error::new(io::ErrorKind::Unsupported, "tracepoint offset exceeds u32")
+                    })?,
+                    size: u16::try_from(field.capture_size).map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "dynamic capture bound exceeds u16",
+                        )
+                    })?,
+                    destination_word: u16::try_from(field.destination_word).unwrap(),
+                    flags: dynamic_flags | CAPTURE_DYNAMIC_METADATA,
+                    data_offset: 0,
+                });
+                let mut copied = 0usize;
+                while copied < field.capture_size {
+                    let size = (field.capture_size - copied).min(size_of::<u64>());
+                    operations.push(CaptureOperation {
+                        source_offset: u32::try_from(field.source_offset).unwrap(),
+                        size: u16::try_from(size).unwrap(),
+                        destination_word: u16::try_from(field.destination_word + 1 + copied / 8)
+                            .unwrap(),
+                        flags: dynamic_flags,
+                        data_offset: u32::try_from(copied).unwrap(),
+                    });
+                    copied += size;
+                }
+                continue;
+            }
             let mut copied = 0usize;
             while copied < field.size {
                 let size = (field.size - copied).min(size_of::<u64>());
@@ -102,7 +167,12 @@ impl CapturePlan {
                     })?,
                     size: u16::try_from(size).unwrap(),
                     destination_word: u16::try_from(field.destination_word + copied / 8).unwrap(),
-                    signed: field.kind == CaptureKind::Scalar && field.signed,
+                    flags: if field.kind == CaptureKind::Scalar && field.signed {
+                        CAPTURE_SIGNED
+                    } else {
+                        0
+                    },
+                    data_offset: 0,
                 });
                 copied += size;
             }
@@ -126,14 +196,45 @@ pub fn capture_plan(
     format: &str,
     selected: Option<&[String]>,
 ) -> io::Result<CapturePlan> {
+    capture_plan_bounded(
+        category,
+        event,
+        format,
+        selected,
+        DEFAULT_DYNAMIC_CAPTURE_BYTES,
+    )
+}
+
+pub fn capture_plan_bounded(
+    category: &str,
+    event: &str,
+    format: &str,
+    selected: Option<&[String]>,
+    dynamic_capture_bytes: usize,
+) -> io::Result<CapturePlan> {
     validate_identifier(category, "category")?;
     validate_identifier(event, "event")?;
-    let fields = fixed_fields(format, selected)?;
+    if dynamic_capture_bytes == 0 {
+        return Err(invalid("dynamic capture bound must be nonzero"));
+    }
+    let fields = selected_fields(format, selected)?;
     let mut destination_word = MOLD_METADATA_WORDS;
     let mut captures = Vec::with_capacity(fields.len());
     let mut context_size = 0;
     for field in fields {
-        let words = field_words(&field);
+        let capture_size = if matches!(
+            field.kind,
+            CaptureKind::DataLoc | CaptureKind::RelativeDataLoc
+        ) {
+            dynamic_capture_bytes
+        } else {
+            0
+        };
+        let words = if capture_size == 0 {
+            field_words(&field)
+        } else {
+            1 + capture_size.div_ceil(8)
+        };
         context_size = context_size.max(
             field
                 .offset
@@ -148,6 +249,7 @@ pub fn capture_plan(
             destination_word,
             words,
             kind: field.kind,
+            capture_size,
         });
         destination_word = destination_word
             .checked_add(words)
@@ -296,6 +398,25 @@ pub fn generate_selected(
 }
 
 fn fixed_fields(format: &str, selected: Option<&[String]>) -> io::Result<Vec<TracepointField>> {
+    let fields = selected_fields(format, selected)?;
+    for field in &fields {
+        if matches!(
+            field.kind,
+            CaptureKind::DataLoc | CaptureKind::RelativeDataLoc
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "field {} requires the generic bounded dynamic-data reader ({})",
+                    field.name, field.declaration
+                ),
+            ));
+        }
+    }
+    Ok(fields)
+}
+
+fn selected_fields(format: &str, selected: Option<&[String]>) -> io::Result<Vec<TracepointField>> {
     let available: Vec<_> = parse_format(format)?
         .into_iter()
         .filter(|field| !field.name.starts_with("common_"))
@@ -306,20 +427,6 @@ fn fixed_fields(format: &str, selected: Option<&[String]>) -> io::Result<Vec<Tra
     };
     if fields.is_empty() {
         return Err(invalid("tracepoint has no event-specific fields"));
-    }
-    for field in &fields {
-        if field.declaration.contains("__data_loc")
-            || field.declaration.contains("__rel_loc")
-            || field.declaration.contains("[]")
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!(
-                    "field {} requires bounded dynamic-data capture ({})",
-                    field.name, field.declaration
-                ),
-            ));
-        }
     }
     Ok(fields)
 }
@@ -608,6 +715,7 @@ format:
                     destination_word: 2,
                     words: 1,
                     kind: CaptureKind::Scalar,
+                    capture_size: 0,
                 },
                 CaptureField {
                     name: "prev_state".to_owned(),
@@ -617,6 +725,7 @@ format:
                     destination_word: 3,
                     words: 1,
                     kind: CaptureKind::Scalar,
+                    capture_size: 0,
                 },
                 CaptureField {
                     name: "next_pid".to_owned(),
@@ -626,6 +735,7 @@ format:
                     destination_word: 4,
                     words: 1,
                     kind: CaptureKind::Scalar,
+                    capture_size: 0,
                 },
             ]
         );
@@ -636,19 +746,22 @@ format:
                     source_offset: 24,
                     size: 4,
                     destination_word: 2,
-                    signed: true,
+                    flags: CAPTURE_SIGNED,
+                    data_offset: 0,
                 },
                 CaptureOperation {
                     source_offset: 32,
                     size: 8,
                     destination_word: 3,
-                    signed: true,
+                    flags: CAPTURE_SIGNED,
+                    data_offset: 0,
                 },
                 CaptureOperation {
                     source_offset: 56,
                     size: 4,
                     destination_word: 4,
-                    signed: true,
+                    flags: CAPTURE_SIGNED,
+                    data_offset: 0,
                 },
             ]
         );
@@ -676,7 +789,7 @@ format:
 
         assert_eq!(plan.fields[0].kind, CaptureKind::PointerAddress);
         assert_eq!(plan.fields[0].words, 1);
-        assert!(!plan.operations().unwrap()[0].signed);
+        assert_eq!(plan.operations().unwrap()[0].flags, 0);
 
         let generated = generate("workqueue", "execute", format).unwrap();
         assert!(generated.rust.contains("pub work: u64"));
@@ -699,13 +812,15 @@ format:
                     source_offset: 16,
                     size: 8,
                     destination_word: 2,
-                    signed: false,
+                    flags: 0,
+                    data_offset: 0,
                 },
                 CaptureOperation {
                     source_offset: 24,
                     size: 5,
                     destination_word: 3,
-                    signed: false,
+                    flags: 0,
+                    data_offset: 0,
                 },
             ]
         );
@@ -723,6 +838,50 @@ format:
             assert_eq!(
                 generate("x", "y", &format).unwrap_err().kind(),
                 io::ErrorKind::Unsupported
+            );
+        }
+    }
+
+    #[test]
+    fn plans_bounded_absolute_and_relative_dynamic_locations() {
+        for (declaration, kind, relative_flag) in [
+            ("__data_loc char[] name", CaptureKind::DataLoc, 0),
+            (
+                "__rel_loc unsigned char[] payload",
+                CaptureKind::RelativeDataLoc,
+                CAPTURE_RELATIVE,
+            ),
+        ] {
+            let format = format!("field:{declaration}; offset:16; size:4; signed:0;");
+            let plan = capture_plan_bounded("x", "y", &format, None, 13).unwrap();
+            assert_eq!(plan.words, 5);
+            assert_eq!(plan.fields[0].kind, kind);
+            assert_eq!(plan.fields[0].capture_size, 13);
+            assert_eq!(
+                plan.operations().unwrap(),
+                [
+                    CaptureOperation {
+                        source_offset: 16,
+                        size: 13,
+                        destination_word: 2,
+                        flags: CAPTURE_DATA_LOC | CAPTURE_DYNAMIC_METADATA | relative_flag,
+                        data_offset: 0,
+                    },
+                    CaptureOperation {
+                        source_offset: 16,
+                        size: 8,
+                        destination_word: 3,
+                        flags: CAPTURE_DATA_LOC | relative_flag,
+                        data_offset: 0,
+                    },
+                    CaptureOperation {
+                        source_offset: 16,
+                        size: 5,
+                        destination_word: 4,
+                        flags: CAPTURE_DATA_LOC | relative_flag,
+                        data_offset: 8,
+                    },
+                ]
             );
         }
     }

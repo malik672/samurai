@@ -193,8 +193,11 @@ The generator includes a timestamp and CPU, maps fixed scalars, arrays, raw
 pointers, and inline structs from their kernel-provided offsets, calculates a
 power-of-two lane capacity within a 64 MiB total transport budget, and emits
 `mold_record!` code. Raw pointers are captured only as integer addresses; the
-generic path never dereferences them. Dynamic locations remain rejected until
-their bounded output size is part of the capture plan.
+generic path never dereferences them. The specialized source generator still
+rejects dynamic locations because their output bound is a runtime-plan choice.
+The runtime plan uses a 64-byte default for `__data_loc` and `__rel_loc`
+fields; callers can select a different startup-time bound with
+`CapturePlan::discover_bounded`.
 
 The same validation is available without invoking a compiler. At startup,
 Samurai can discover a capture plan directly from the running kernel:
@@ -213,7 +216,10 @@ Each plan fixes the capture kind, source offset, byte width, signedness,
 destination Mold word, record width, and required tracepoint-context span.
 Unknown fixed-size inline declarations are preserved as bytes. Dereferencing a
 pointer remains an explicit event policy rather than something inferred from
-kernel metadata.
+kernel metadata. Dynamic fields reserve one metadata word containing original
+and captured lengths followed by zero-padded data words. Ordinary locators are
+relative to the event context; relative locators are relative to the locator
+field itself. Both are clamped before the generic reader copies any bytes.
 
 The prebuilt generic reader executes that plan without a runtime compiler. For
 example, record three fixed `sched_switch` fields from the current kernel:
@@ -232,6 +238,8 @@ At startup, userspace lowers selected fields into at most 32 bounded copy
 operations and installs them in BPF array maps. Each operation copies one to
 eight bytes, allowing the final partial word of an inline struct. The program
 uses a fixed 34-word Mold ABI and never interprets an unannotated pointer.
+Dynamic output reports truncation when the kernel-provided length exceeds its
+configured capture bound.
 
 ### Reproducible transport comparison
 

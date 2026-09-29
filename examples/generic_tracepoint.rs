@@ -1,7 +1,7 @@
 use samurai::{
     bpf::object::ObjectLoader,
     mold::{MappedMold, MoldEntry},
-    tracepoint_schema::{CapturePlan, GENERIC_CAPTURE_WORDS},
+    tracepoint_schema::{CaptureKind, CapturePlan, GENERIC_CAPTURE_WORDS},
     utils::tracepoint::TracepointResolver,
 };
 use std::{
@@ -93,7 +93,21 @@ fn print_record(plan: &CapturePlan, words: &[u64; GENERIC_CAPTURE_WORDS]) {
     print!("{} CPU {}", words[0], words[1]);
     for field in &plan.fields {
         let values = &words[field.destination_word..field.destination_word + field.words];
-        if field.words == 1 {
+        if matches!(
+            field.kind,
+            CaptureKind::DataLoc | CaptureKind::RelativeDataLoc
+        ) {
+            let captured_length = values[0] as u32 as usize;
+            let original_length = (values[0] >> 32) as u32 as usize;
+            print!(" {}=0x", field.name);
+            for index in 0..captured_length {
+                let byte = values[1 + index / 8].to_ne_bytes()[index % 8];
+                print!("{byte:02x}");
+            }
+            if captured_length < original_length {
+                print!("(truncated {captured_length}/{original_length})");
+            }
+        } else if field.words == 1 {
             if field.signed {
                 print!(" {}={}", field.name, values[0] as i64);
             } else {
