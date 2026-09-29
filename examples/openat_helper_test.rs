@@ -34,7 +34,7 @@ fn main() -> io::Result<()> {
         )
     })?;
     let resolver = TracepointResolver::new();
-    let fields = ["common_pid".to_owned(), "filename".to_owned()];
+    let fields = ["filename".to_owned()];
     let plan = CapturePlan::discover(&resolver, "syscalls", "sys_enter_openat", Some(&fields))?;
     let filename = plan
         .fields
@@ -47,12 +47,6 @@ fn main() -> io::Result<()> {
             "openat filename policy was not applied",
         ));
     }
-    let pid_word = plan
-        .fields
-        .iter()
-        .find(|field| field.name == "common_pid")
-        .ok_or_else(|| missing("common_pid capture field"))?
-        .destination_word;
     let filename_word = filename.destination_word;
     let operations = plan.operations()?;
 
@@ -100,7 +94,7 @@ fn main() -> io::Result<()> {
         for worker in &mut workers {
             match worker.try_next()? {
                 Some(MoldEntry::Data(words)) => {
-                    let pid = words[pid_word] as u32;
+                    let pid = (words[1] >> 32) as u32;
                     *observed_pids.entry(pid).or_default() += 1;
                     if pid == wanted_pid {
                         let metadata = words[filename_word];

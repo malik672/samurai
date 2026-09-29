@@ -141,7 +141,7 @@ clang -target bpfel -mcpu=v3 -O2 -I examples/bpf \
 cargo build --release --example generic_tracepoint
 sudo ./target/release/examples/generic_tracepoint \
   target/generic-tracepoint.bpf.o \
-  syscalls sys_enter_openat common_pid,dfd,filename,flags,mode 5
+  syscalls sys_enter_openat dfd,filename,flags,mode 5
 ```
 
 The generic reader captures up to 127 pathname bytes plus the terminator and

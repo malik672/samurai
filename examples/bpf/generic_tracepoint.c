@@ -13,6 +13,7 @@
 
 static u64 (*const ktime_get_ns)(void) = (void *)5;
 static u64 (*const get_smp_processor_id)(void) = (void *)8;
+static u64 (*const get_current_pid_tgid)(void) = (void *)14;
 static long (*const probe_read_kernel)(void *, u32, const void *) = (void *)113;
 static long (*const probe_read_user_str)(void *, u32, const void *) = (void *)114;
 
@@ -231,8 +232,9 @@ int record_generic_tracepoint(void *ctx) {
     if (!scratch) return 0;
 
     u32 cpu = (u32)get_smp_processor_id();
+    u32 pid = (u32)(get_current_pid_tgid() >> 32);
     scratch->words[0] = ktime_get_ns();
-    scratch->words[1] = cpu;
+    scratch->words[1] = ((u64)pid << 32) | cpu;
 
 #define CAPTURE_INDEX(index, word)                                             \
     if (operation_count > (index)) {                                           \

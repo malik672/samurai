@@ -90,7 +90,12 @@ fn main() -> io::Result<()> {
 }
 
 fn print_record(plan: &CapturePlan, words: &[u64; GENERIC_CAPTURE_WORDS]) {
-    print!("{} CPU {}", words[0], words[1]);
+    print!(
+        "{} CPU {} pid={}",
+        words[0],
+        words[1] as u32,
+        words[1] >> 32
+    );
     for field in &plan.fields {
         let values = &words[field.destination_word..field.destination_word + field.words];
         if field.kind == CaptureKind::UserString {

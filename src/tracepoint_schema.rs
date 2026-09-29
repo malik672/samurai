@@ -530,14 +530,10 @@ fn fixed_fields(format: &str, selected: Option<&[String]>) -> io::Result<Vec<Tra
 }
 
 fn selected_fields(format: &str, selected: Option<&[String]>) -> io::Result<Vec<TracepointField>> {
-    let all = parse_format(format)?;
-    let available: Vec<_> = if selected.is_some() {
-        all
-    } else {
-        all.into_iter()
-            .filter(|field| !field.name.starts_with("common_"))
-            .collect()
-    };
+    let available: Vec<_> = parse_format(format)?
+        .into_iter()
+        .filter(|field| !field.name.starts_with("common_"))
+        .collect();
     let fields = match selected {
         Some(selected) => select_fields(&available, selected)?,
         None => available,
@@ -1012,7 +1008,7 @@ field:int dfd; offset:16; size:8; signed:1;
 field:const char * filename; offset:24; size:8; signed:0;
 field:int flags; offset:32; size:8; signed:0;
 "#;
-        let selected = ["common_pid".to_owned(), "filename".to_owned()];
+        let selected = ["filename".to_owned()];
         let plan = capture_plan_with_registry(
             "syscalls",
             "sys_enter_openat",
@@ -1023,15 +1019,15 @@ field:int flags; offset:32; size:8; signed:0;
         )
         .unwrap();
 
-        assert_eq!(plan.words, 20);
-        assert_eq!(plan.fields[1].kind, CaptureKind::UserString);
-        assert_eq!(plan.fields[1].capture_size, 128);
+        assert_eq!(plan.words, 19);
+        assert_eq!(plan.fields[0].kind, CaptureKind::UserString);
+        assert_eq!(plan.fields[0].capture_size, 128);
         assert_eq!(
-            plan.operations().unwrap()[1],
+            plan.operations().unwrap()[0],
             CaptureOperation {
                 source_offset: 24,
                 size: 128,
-                destination_word: 3,
+                destination_word: 2,
                 flags: CAPTURE_USER_STRING,
                 data_offset: 8,
             }
