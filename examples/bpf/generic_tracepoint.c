@@ -10,12 +10,16 @@
 #define CAPTURE_RELATIVE 4U
 #define CAPTURE_DYNAMIC_METADATA 8U
 #define CAPTURE_USER_STRING 16U
+#define CAPTURE_POINTER_BYTES 32U
+#define CAPTURE_KERNEL_MEMORY 64U
 
 static u64 (*const ktime_get_ns)(void) = (void *)5;
 static u64 (*const get_smp_processor_id)(void) = (void *)8;
 static u64 (*const get_current_pid_tgid)(void) = (void *)14;
 static long (*const probe_read_kernel)(void *, u32, const void *) = (void *)113;
+static long (*const probe_read_user)(void *, u32, const void *) = (void *)112;
 static long (*const probe_read_user_str)(void *, u32, const void *) = (void *)114;
+static long (*const probe_read_kernel_str)(void *, u32, const void *) = (void *)115;
 
 struct capture_operation {
     u32 source_offset;
@@ -23,6 +27,9 @@ struct capture_operation {
     unsigned short destination_word;
     u32 flags;
     u32 data_offset;
+    u32 auxiliary_offset;
+    unsigned short pointer_size;
+    unsigned short auxiliary_size;
 };
 
 struct capture_scratch {
@@ -84,12 +91,15 @@ read_fixed(void *ctx, u32 source_offset, unsigned short size, u64 *value) {
 #define DEFINE_USER_STRING(word)                                                \
     static __attribute__((noinline)) long read_user_string_##word(              \
         void *ctx, u32 source_offset, u32 pointer_size,                         \
-        struct capture_scratch *scratch) {                                      \
+        u32 kernel_memory, struct capture_scratch *scratch) {                   \
         u64 pointer = 0;                                                        \
         if (read_fixed(ctx, source_offset, (unsigned short)pointer_size,         \
                        &pointer) < 0)                                           \
             return -1;                                                         \
         __builtin_memset(&scratch->words[(word) + 1], 0, 128);                  \
+        if (kernel_memory)                                                      \
+            return probe_read_kernel_str(&scratch->words[(word) + 1], 128,      \
+                                         (const void *)pointer);                \
         return probe_read_user_str(&scratch->words[(word) + 1], 128,            \
                                    (const void *)pointer);                      \
     }
@@ -114,23 +124,56 @@ DEFINE_USER_STRING(17)
 static __attribute__((always_inline)) long
 read_user_string(void *ctx, struct capture_operation *operation,
                  struct capture_scratch *scratch) {
+    u32 kernel_memory = operation->flags & CAPTURE_KERNEL_MEMORY;
     switch (operation->destination_word) {
-    case 2: return read_user_string_2(ctx, operation->source_offset, operation->data_offset, scratch);
-    case 3: return read_user_string_3(ctx, operation->source_offset, operation->data_offset, scratch);
-    case 4: return read_user_string_4(ctx, operation->source_offset, operation->data_offset, scratch);
-    case 5: return read_user_string_5(ctx, operation->source_offset, operation->data_offset, scratch);
-    case 6: return read_user_string_6(ctx, operation->source_offset, operation->data_offset, scratch);
-    case 7: return read_user_string_7(ctx, operation->source_offset, operation->data_offset, scratch);
-    case 8: return read_user_string_8(ctx, operation->source_offset, operation->data_offset, scratch);
-    case 9: return read_user_string_9(ctx, operation->source_offset, operation->data_offset, scratch);
-    case 10: return read_user_string_10(ctx, operation->source_offset, operation->data_offset, scratch);
-    case 11: return read_user_string_11(ctx, operation->source_offset, operation->data_offset, scratch);
-    case 12: return read_user_string_12(ctx, operation->source_offset, operation->data_offset, scratch);
-    case 13: return read_user_string_13(ctx, operation->source_offset, operation->data_offset, scratch);
-    case 14: return read_user_string_14(ctx, operation->source_offset, operation->data_offset, scratch);
-    case 15: return read_user_string_15(ctx, operation->source_offset, operation->data_offset, scratch);
-    case 16: return read_user_string_16(ctx, operation->source_offset, operation->data_offset, scratch);
-    case 17: return read_user_string_17(ctx, operation->source_offset, operation->data_offset, scratch);
+    case 2: return read_user_string_2(ctx, operation->source_offset, operation->pointer_size, kernel_memory, scratch);
+    case 3: return read_user_string_3(ctx, operation->source_offset, operation->pointer_size, kernel_memory, scratch);
+    case 4: return read_user_string_4(ctx, operation->source_offset, operation->pointer_size, kernel_memory, scratch);
+    case 5: return read_user_string_5(ctx, operation->source_offset, operation->pointer_size, kernel_memory, scratch);
+    case 6: return read_user_string_6(ctx, operation->source_offset, operation->pointer_size, kernel_memory, scratch);
+    case 7: return read_user_string_7(ctx, operation->source_offset, operation->pointer_size, kernel_memory, scratch);
+    case 8: return read_user_string_8(ctx, operation->source_offset, operation->pointer_size, kernel_memory, scratch);
+    case 9: return read_user_string_9(ctx, operation->source_offset, operation->pointer_size, kernel_memory, scratch);
+    case 10: return read_user_string_10(ctx, operation->source_offset, operation->pointer_size, kernel_memory, scratch);
+    case 11: return read_user_string_11(ctx, operation->source_offset, operation->pointer_size, kernel_memory, scratch);
+    case 12: return read_user_string_12(ctx, operation->source_offset, operation->pointer_size, kernel_memory, scratch);
+    case 13: return read_user_string_13(ctx, operation->source_offset, operation->pointer_size, kernel_memory, scratch);
+    case 14: return read_user_string_14(ctx, operation->source_offset, operation->pointer_size, kernel_memory, scratch);
+    case 15: return read_user_string_15(ctx, operation->source_offset, operation->pointer_size, kernel_memory, scratch);
+    case 16: return read_user_string_16(ctx, operation->source_offset, operation->pointer_size, kernel_memory, scratch);
+    case 17: return read_user_string_17(ctx, operation->source_offset, operation->pointer_size, kernel_memory, scratch);
+    default: return -1;
+    }
+}
+
+#define DEFINE_MEMORY_READ(size)                                                \
+    static __attribute__((noinline)) int read_memory_##size(                    \
+        u64 address, u32 kernel_memory, u64 *value) {                           \
+        if (kernel_memory)                                                      \
+            return probe_read_kernel(value, size, (const void *)address);       \
+        return probe_read_user(value, size, (const void *)address);             \
+    }
+DEFINE_MEMORY_READ(1)
+DEFINE_MEMORY_READ(2)
+DEFINE_MEMORY_READ(3)
+DEFINE_MEMORY_READ(4)
+DEFINE_MEMORY_READ(5)
+DEFINE_MEMORY_READ(6)
+DEFINE_MEMORY_READ(7)
+DEFINE_MEMORY_READ(8)
+#undef DEFINE_MEMORY_READ
+
+static __attribute__((always_inline)) int
+read_memory(u64 address, u32 kernel_memory, unsigned short size, u64 *value) {
+    switch (size) {
+    case 1: return read_memory_1(address, kernel_memory, value);
+    case 2: return read_memory_2(address, kernel_memory, value);
+    case 3: return read_memory_3(address, kernel_memory, value);
+    case 4: return read_memory_4(address, kernel_memory, value);
+    case 5: return read_memory_5(address, kernel_memory, value);
+    case 6: return read_memory_6(address, kernel_memory, value);
+    case 7: return read_memory_7(address, kernel_memory, value);
+    case 8: return read_memory_8(address, kernel_memory, value);
     default: return -1;
     }
 }
@@ -147,6 +190,36 @@ capture_one(void *ctx, u32 index, struct capture_scratch *scratch, u64 *captured
         u32 length = result > 0 ? (u32)(result - 1) : 0;
         u32 error = result < 0 ? (u32)result : 0;
         *captured = ((u64)error << 32) | length;
+        return 1;
+    }
+    if (operation->flags & CAPTURE_POINTER_BYTES) {
+        u64 pointer = 0;
+        u64 length_word = 0;
+        if (read_fixed(ctx, operation->source_offset, operation->pointer_size,
+                       &pointer) < 0 ||
+            read_fixed(ctx, operation->auxiliary_offset,
+                       operation->auxiliary_size, &length_word) < 0)
+            return 0;
+        u32 original_length = length_word > 0xffffffffULL
+                                  ? 0xffffffffU
+                                  : (u32)length_word;
+        if (operation->flags & CAPTURE_DYNAMIC_METADATA) {
+            u32 captured_length = original_length;
+            if (captured_length > size) captured_length = size;
+            *captured = ((u64)original_length << 32) | captured_length;
+            return 1;
+        }
+        if (operation->data_offset >= original_length) {
+            *captured = 0;
+            return 1;
+        }
+        u32 remaining = original_length - operation->data_offset;
+        if (remaining < size) size = (unsigned short)remaining;
+        if (read_memory(pointer + operation->data_offset,
+                        operation->flags & CAPTURE_KERNEL_MEMORY, size,
+                        &value) < 0)
+            return 0;
+        *captured = value;
         return 1;
     }
     if (operation->flags & CAPTURE_DATA_LOC) {

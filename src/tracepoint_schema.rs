@@ -12,6 +12,8 @@ const CAPTURE_DATA_LOC: u32 = 1 << 1;
 const CAPTURE_RELATIVE: u32 = 1 << 2;
 const CAPTURE_DYNAMIC_METADATA: u32 = 1 << 3;
 const CAPTURE_USER_STRING: u32 = 1 << 4;
+const CAPTURE_POINTER_BYTES: u32 = 1 << 5;
+const CAPTURE_KERNEL_MEMORY: u32 = 1 << 6;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureKind {
@@ -23,12 +25,28 @@ pub enum CaptureKind {
     DataLoc,
     RelativeDataLoc,
     UserString,
+    UserBytes,
+    KernelString,
+    KernelBytes,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PointerCapture {
     Address,
-    UserString { max_len: usize },
+    UserString {
+        max_len: usize,
+    },
+    UserBytes {
+        length_field: &'static str,
+        max_len: usize,
+    },
+    KernelString {
+        max_len: usize,
+    },
+    KernelBytes {
+        length_field: &'static str,
+        max_len: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,11 +89,12 @@ impl PolicyRegistry {
         category: &str,
         event: &str,
         field: &TracepointField,
-    ) -> io::Result<PointerCapture> {
+        available: &[TracepointField],
+    ) -> io::Result<(PointerCapture, Option<(usize, usize)>)> {
         let Some(policy) = self.policies.iter().find(|policy| {
             policy.category == category && policy.event == event && policy.field == field.name
         }) else {
-            return Ok(PointerCapture::Address);
+            return Ok((PointerCapture::Address, None));
         };
         if field.kind != CaptureKind::PointerAddress {
             return Err(invalid(format!(
@@ -83,7 +102,37 @@ impl PolicyRegistry {
                 field.name, field.declaration
             )));
         }
-        Ok(policy.capture)
+        if !matches!(field.size, 4 | 8) {
+            return Err(invalid(format!(
+                "policy for {category}:{event}.{} requires a 4- or 8-byte pointer",
+                field.name
+            )));
+        }
+        let length = match policy.capture {
+            PointerCapture::UserBytes { length_field, .. }
+            | PointerCapture::KernelBytes { length_field, .. } => {
+                let source = available
+                    .iter()
+                    .find(|candidate| candidate.name == length_field)
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "policy for {category}:{event}.{} requires missing length field {length_field}",
+                            field.name
+                        ))
+                    })?;
+                if source.kind != CaptureKind::Scalar
+                    || source.signed
+                    || !matches!(source.size, 1 | 2 | 4 | 8)
+                {
+                    return Err(invalid(format!(
+                        "policy length field {length_field} must be an unsigned fixed scalar"
+                    )));
+                }
+                Some((source.offset, source.size))
+            }
+            _ => None,
+        };
+        Ok((policy.capture, length))
     }
 }
 
@@ -127,6 +176,7 @@ pub struct CaptureField {
     pub kind: CaptureKind,
     /// Maximum bytes copied for a dynamic field; zero for fixed fields.
     pub capture_size: usize,
+    pub length_source: Option<(usize, usize)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -136,17 +186,23 @@ pub struct CaptureOperation {
     pub destination_word: u16,
     pub flags: u32,
     pub data_offset: u32,
+    pub auxiliary_offset: u32,
+    pub pointer_size: u16,
+    pub auxiliary_size: u16,
 }
 
 impl CaptureOperation {
-    /// Stable 16-byte ABI consumed by `examples/bpf/generic_tracepoint.c`.
-    pub fn to_bytes(self) -> [u8; 16] {
-        let mut bytes = [0; 16];
+    /// Stable 24-byte ABI consumed by `examples/bpf/generic_tracepoint.c`.
+    pub fn to_bytes(self) -> [u8; 24] {
+        let mut bytes = [0; 24];
         bytes[..4].copy_from_slice(&self.source_offset.to_ne_bytes());
         bytes[4..6].copy_from_slice(&self.size.to_ne_bytes());
         bytes[6..8].copy_from_slice(&self.destination_word.to_ne_bytes());
         bytes[8..12].copy_from_slice(&self.flags.to_ne_bytes());
         bytes[12..16].copy_from_slice(&self.data_offset.to_ne_bytes());
+        bytes[16..20].copy_from_slice(&self.auxiliary_offset.to_ne_bytes());
+        bytes[20..22].copy_from_slice(&self.pointer_size.to_ne_bytes());
+        bytes[22..24].copy_from_slice(&self.auxiliary_size.to_ne_bytes());
         bytes
     }
 }
@@ -190,7 +246,10 @@ impl CapturePlan {
     pub fn operations(&self) -> io::Result<Vec<CaptureOperation>> {
         let mut operations = Vec::new();
         for field in &self.fields {
-            if field.kind == CaptureKind::UserString {
+            if matches!(
+                field.kind,
+                CaptureKind::UserString | CaptureKind::KernelString
+            ) {
                 if field.capture_size != 128 {
                     return Err(io::Error::new(
                         io::ErrorKind::Unsupported,
@@ -203,9 +262,61 @@ impl CapturePlan {
                     })?,
                     size: 128,
                     destination_word: u16::try_from(field.destination_word).unwrap(),
-                    flags: CAPTURE_USER_STRING,
-                    data_offset: u32::try_from(field.size).unwrap(),
+                    flags: CAPTURE_USER_STRING
+                        | if field.kind == CaptureKind::KernelString {
+                            CAPTURE_KERNEL_MEMORY
+                        } else {
+                            0
+                        },
+                    data_offset: 0,
+                    auxiliary_offset: 0,
+                    pointer_size: u16::try_from(field.size).unwrap(),
+                    auxiliary_size: 0,
                 });
+                continue;
+            }
+            if matches!(
+                field.kind,
+                CaptureKind::UserBytes | CaptureKind::KernelBytes
+            ) {
+                let (length_offset, length_size) = field.length_source.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "byte policy lacks length source",
+                    )
+                })?;
+                let memory_flags = CAPTURE_POINTER_BYTES
+                    | if field.kind == CaptureKind::KernelBytes {
+                        CAPTURE_KERNEL_MEMORY
+                    } else {
+                        0
+                    };
+                operations.push(CaptureOperation {
+                    source_offset: u32::try_from(field.source_offset).unwrap(),
+                    size: u16::try_from(field.capture_size).unwrap(),
+                    destination_word: u16::try_from(field.destination_word).unwrap(),
+                    flags: memory_flags | CAPTURE_DYNAMIC_METADATA,
+                    data_offset: 0,
+                    auxiliary_offset: u32::try_from(length_offset).unwrap(),
+                    pointer_size: u16::try_from(field.size).unwrap(),
+                    auxiliary_size: u16::try_from(length_size).unwrap(),
+                });
+                let mut copied = 0usize;
+                while copied < field.capture_size {
+                    let size = (field.capture_size - copied).min(8);
+                    operations.push(CaptureOperation {
+                        source_offset: u32::try_from(field.source_offset).unwrap(),
+                        size: u16::try_from(size).unwrap(),
+                        destination_word: u16::try_from(field.destination_word + 1 + copied / 8)
+                            .unwrap(),
+                        flags: memory_flags,
+                        data_offset: u32::try_from(copied).unwrap(),
+                        auxiliary_offset: u32::try_from(length_offset).unwrap(),
+                        pointer_size: u16::try_from(field.size).unwrap(),
+                        auxiliary_size: u16::try_from(length_size).unwrap(),
+                    });
+                    copied += size;
+                }
                 continue;
             }
             if matches!(
@@ -231,6 +342,9 @@ impl CapturePlan {
                     destination_word: u16::try_from(field.destination_word).unwrap(),
                     flags: dynamic_flags | CAPTURE_DYNAMIC_METADATA,
                     data_offset: 0,
+                    auxiliary_offset: 0,
+                    pointer_size: 0,
+                    auxiliary_size: 0,
                 });
                 let mut copied = 0usize;
                 while copied < field.capture_size {
@@ -242,6 +356,9 @@ impl CapturePlan {
                             .unwrap(),
                         flags: dynamic_flags,
                         data_offset: u32::try_from(copied).unwrap(),
+                        auxiliary_offset: 0,
+                        pointer_size: 0,
+                        auxiliary_size: 0,
                     });
                     copied += size;
                 }
@@ -262,6 +379,9 @@ impl CapturePlan {
                         0
                     },
                     data_offset: 0,
+                    auxiliary_offset: 0,
+                    pointer_size: 0,
+                    auxiliary_size: 0,
                 });
                 copied += size;
             }
@@ -324,16 +444,26 @@ pub fn capture_plan_with_registry(
     if dynamic_capture_bytes == 0 {
         return Err(invalid("dynamic capture bound must be nonzero"));
     }
+    let available = parse_format(format)?;
     let fields = selected_fields(format, selected)?;
     let mut destination_word = MOLD_METADATA_WORDS;
     let mut captures = Vec::with_capacity(fields.len());
     let mut context_size = 0;
     for mut field in fields {
-        let pointer_capture = policies.capture_for(category, event, &field)?;
-        if let PointerCapture::UserString { .. } = pointer_capture {
-            field.kind = CaptureKind::UserString;
-        }
-        let capture_size = if let PointerCapture::UserString { max_len } = pointer_capture {
+        let (pointer_capture, length_source) =
+            policies.capture_for(category, event, &field, &available)?;
+        field.kind = match pointer_capture {
+            PointerCapture::UserString { .. } => CaptureKind::UserString,
+            PointerCapture::UserBytes { .. } => CaptureKind::UserBytes,
+            PointerCapture::KernelString { .. } => CaptureKind::KernelString,
+            PointerCapture::KernelBytes { .. } => CaptureKind::KernelBytes,
+            PointerCapture::Address => field.kind,
+        };
+        let capture_size = if let PointerCapture::UserString { max_len }
+        | PointerCapture::UserBytes { max_len, .. }
+        | PointerCapture::KernelString { max_len }
+        | PointerCapture::KernelBytes { max_len, .. } = pointer_capture
+        {
             max_len
         } else if matches!(
             field.kind,
@@ -363,6 +493,7 @@ pub fn capture_plan_with_registry(
             words,
             kind: field.kind,
             capture_size,
+            length_source,
         });
         destination_word = destination_word
             .checked_add(words)
@@ -829,6 +960,7 @@ format:
                     words: 1,
                     kind: CaptureKind::Scalar,
                     capture_size: 0,
+                    length_source: None,
                 },
                 CaptureField {
                     name: "prev_state".to_owned(),
@@ -839,6 +971,7 @@ format:
                     words: 1,
                     kind: CaptureKind::Scalar,
                     capture_size: 0,
+                    length_source: None,
                 },
                 CaptureField {
                     name: "next_pid".to_owned(),
@@ -849,6 +982,7 @@ format:
                     words: 1,
                     kind: CaptureKind::Scalar,
                     capture_size: 0,
+                    length_source: None,
                 },
             ]
         );
@@ -861,6 +995,9 @@ format:
                     destination_word: 2,
                     flags: CAPTURE_SIGNED,
                     data_offset: 0,
+                    auxiliary_offset: 0,
+                    pointer_size: 0,
+                    auxiliary_size: 0,
                 },
                 CaptureOperation {
                     source_offset: 32,
@@ -868,6 +1005,9 @@ format:
                     destination_word: 3,
                     flags: CAPTURE_SIGNED,
                     data_offset: 0,
+                    auxiliary_offset: 0,
+                    pointer_size: 0,
+                    auxiliary_size: 0,
                 },
                 CaptureOperation {
                     source_offset: 56,
@@ -875,6 +1015,9 @@ format:
                     destination_word: 4,
                     flags: CAPTURE_SIGNED,
                     data_offset: 0,
+                    auxiliary_offset: 0,
+                    pointer_size: 0,
+                    auxiliary_size: 0,
                 },
             ]
         );
@@ -927,6 +1070,9 @@ format:
                     destination_word: 2,
                     flags: 0,
                     data_offset: 0,
+                    auxiliary_offset: 0,
+                    pointer_size: 0,
+                    auxiliary_size: 0,
                 },
                 CaptureOperation {
                     source_offset: 24,
@@ -934,6 +1080,9 @@ format:
                     destination_word: 3,
                     flags: 0,
                     data_offset: 0,
+                    auxiliary_offset: 0,
+                    pointer_size: 0,
+                    auxiliary_size: 0,
                 },
             ]
         );
@@ -979,6 +1128,9 @@ format:
                         destination_word: 2,
                         flags: CAPTURE_DATA_LOC | CAPTURE_DYNAMIC_METADATA | relative_flag,
                         data_offset: 0,
+                        auxiliary_offset: 0,
+                        pointer_size: 0,
+                        auxiliary_size: 0,
                     },
                     CaptureOperation {
                         source_offset: 16,
@@ -986,6 +1138,9 @@ format:
                         destination_word: 3,
                         flags: CAPTURE_DATA_LOC | relative_flag,
                         data_offset: 0,
+                        auxiliary_offset: 0,
+                        pointer_size: 0,
+                        auxiliary_size: 0,
                     },
                     CaptureOperation {
                         source_offset: 16,
@@ -993,6 +1148,9 @@ format:
                         destination_word: 4,
                         flags: CAPTURE_DATA_LOC | relative_flag,
                         data_offset: 8,
+                        auxiliary_offset: 0,
+                        pointer_size: 0,
+                        auxiliary_size: 0,
                     },
                 ]
             );
@@ -1029,7 +1187,10 @@ field:int flags; offset:32; size:8; signed:0;
                 size: 128,
                 destination_word: 2,
                 flags: CAPTURE_USER_STRING,
-                data_offset: 8,
+                data_offset: 0,
+                auxiliary_offset: 0,
+                pointer_size: 8,
+                auxiliary_size: 0,
             }
         );
     }
@@ -1048,6 +1209,115 @@ field:int flags; offset:32; size:8; signed:0;
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("requires a pointer"));
+    }
+
+    #[test]
+    fn lowers_user_bytes_kernel_string_and_kernel_bytes_policies() {
+        static POLICIES: &[CapturePolicy] = &[
+            CapturePolicy {
+                category: "test",
+                event: "memory",
+                field: "user_buffer",
+                capture: PointerCapture::UserBytes {
+                    length_field: "length",
+                    max_len: 13,
+                },
+            },
+            CapturePolicy {
+                category: "test",
+                event: "memory",
+                field: "kernel_name",
+                capture: PointerCapture::KernelString { max_len: 128 },
+            },
+            CapturePolicy {
+                category: "test",
+                event: "memory",
+                field: "kernel_buffer",
+                capture: PointerCapture::KernelBytes {
+                    length_field: "length",
+                    max_len: 13,
+                },
+            },
+        ];
+        let format = r#"
+field:const void * user_buffer; offset:16; size:8; signed:0;
+field:const char * kernel_name; offset:24; size:8; signed:0;
+field:const void * kernel_buffer; offset:32; size:8; signed:0;
+field:unsigned int length; offset:40; size:4; signed:0;
+"#;
+
+        for (name, kind, memory_flag) in [
+            ("user_buffer", CaptureKind::UserBytes, 0),
+            (
+                "kernel_name",
+                CaptureKind::KernelString,
+                CAPTURE_KERNEL_MEMORY,
+            ),
+            (
+                "kernel_buffer",
+                CaptureKind::KernelBytes,
+                CAPTURE_KERNEL_MEMORY,
+            ),
+        ] {
+            let plan = capture_plan_with_registry(
+                "test",
+                "memory",
+                format,
+                Some(&[name.to_owned()]),
+                DEFAULT_DYNAMIC_CAPTURE_BYTES,
+                PolicyRegistry::from_static(POLICIES),
+            )
+            .unwrap();
+            assert_eq!(plan.fields[0].kind, kind);
+            let operations = plan.operations().unwrap();
+            if kind == CaptureKind::KernelString {
+                assert_eq!(operations.len(), 1);
+                assert_eq!(
+                    operations[0].flags,
+                    CAPTURE_USER_STRING | CAPTURE_KERNEL_MEMORY
+                );
+                assert_eq!(operations[0].pointer_size, 8);
+            } else {
+                assert_eq!(operations.len(), 3);
+                assert_eq!(operations[0].auxiliary_offset, 40);
+                assert_eq!(operations[0].auxiliary_size, 4);
+                assert_eq!(
+                    operations[0].flags,
+                    CAPTURE_POINTER_BYTES | CAPTURE_DYNAMIC_METADATA | memory_flag
+                );
+                assert_eq!(operations[2].data_offset, 8);
+                assert_eq!(operations[2].size, 5);
+            }
+        }
+    }
+
+    #[test]
+    fn byte_policy_rejects_missing_or_non_scalar_length_fields() {
+        static POLICY: &[CapturePolicy] = &[CapturePolicy {
+            category: "test",
+            event: "bad_length",
+            field: "buffer",
+            capture: PointerCapture::UserBytes {
+                length_field: "length",
+                max_len: 16,
+            },
+        }];
+        for format in [
+            "field:const void * buffer; offset:16; size:8; signed:0;",
+            "field:const void * buffer; offset:16; size:8; signed:0;\nfield:char length[4]; offset:24; size:4; signed:0;",
+        ] {
+            assert!(
+                capture_plan_with_registry(
+                    "test",
+                    "bad_length",
+                    format,
+                    None,
+                    DEFAULT_DYNAMIC_CAPTURE_BYTES,
+                    PolicyRegistry::from_static(POLICY),
+                )
+                .is_err()
+            );
+        }
     }
 
     fn compile_generated_rust(source: &str) {

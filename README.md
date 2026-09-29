@@ -224,6 +224,13 @@ and captured lengths followed by zero-padded data words. Ordinary locators are
 relative to the event context; relative locators are relative to the locator
 field itself. Both are clamped before the generic reader copies any bytes.
 
+Pointer policies provide four bounded primitives: `UserString`, `UserBytes`,
+`KernelString`, and `KernelBytes`. Byte policies name a length field, and
+startup validation requires that field to remain a fixed scalar in the running
+kernel schema. Unannotated pointers remain addresses. String and byte helpers
+are selected only by an explicit event policy; Samurai never guesses which
+address space a pointer belongs to.
+
 The prebuilt generic reader executes that plan without a runtime compiler. For
 example, record three fixed `sched_switch` fields from the current kernel:
 

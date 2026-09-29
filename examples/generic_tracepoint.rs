@@ -98,7 +98,10 @@ fn print_record(plan: &CapturePlan, words: &[u64; GENERIC_CAPTURE_WORDS]) {
     );
     for field in &plan.fields {
         let values = &words[field.destination_word..field.destination_word + field.words];
-        if field.kind == CaptureKind::UserString {
+        if matches!(
+            field.kind,
+            CaptureKind::UserString | CaptureKind::KernelString
+        ) {
             let length = values[0] as u32 as usize;
             let error = (values[0] >> 32) as u32 as i32;
             print!(" {}=\"", field.name);
@@ -114,7 +117,10 @@ fn print_record(plan: &CapturePlan, words: &[u64; GENERIC_CAPTURE_WORDS]) {
             }
         } else if matches!(
             field.kind,
-            CaptureKind::DataLoc | CaptureKind::RelativeDataLoc
+            CaptureKind::DataLoc
+                | CaptureKind::RelativeDataLoc
+                | CaptureKind::UserBytes
+                | CaptureKind::KernelBytes
         ) {
             let captured_length = values[0] as u32 as usize;
             let original_length = (values[0] >> 32) as u32 as usize;
