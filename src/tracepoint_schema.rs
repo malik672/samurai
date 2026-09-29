@@ -6,6 +6,17 @@ const BPF_STACK_RECORD_BUDGET: usize = 384;
 pub const GENERIC_CAPTURE_WORDS: usize = 34;
 pub const GENERIC_CAPTURE_OPERATIONS: usize = GENERIC_CAPTURE_WORDS - MOLD_METADATA_WORDS;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureKind {
+    Scalar,
+    FixedArray,
+    FixedStruct,
+    PointerAddress,
+    FunctionPointer,
+    DataLoc,
+    RelativeDataLoc,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TracepointField {
     pub declaration: String,
@@ -14,6 +25,7 @@ pub struct TracepointField {
     pub size: usize,
     pub signed: bool,
     pub array_len: Option<usize>,
+    pub kind: CaptureKind,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -42,6 +54,7 @@ pub struct CaptureField {
     pub signed: bool,
     pub destination_word: usize,
     pub words: usize,
+    pub kind: CaptureKind,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,7 +102,7 @@ impl CapturePlan {
                     })?,
                     size: u16::try_from(size).unwrap(),
                     destination_word: u16::try_from(field.destination_word + copied / 8).unwrap(),
-                    signed: field.signed && field.words == 1,
+                    signed: field.kind == CaptureKind::Scalar && field.signed,
                 });
                 copied += size;
             }
@@ -134,6 +147,7 @@ pub fn capture_plan(
             signed: field.signed,
             destination_word,
             words,
+            kind: field.kind,
         });
         destination_word = destination_word
             .checked_add(words)
@@ -241,7 +255,10 @@ pub fn generate_selected(
     let mut word = 2;
     for field in &fields {
         writeln!(bpf_c, "    /* {} */", field.declaration).unwrap();
-        if field.array_len.is_some() {
+        if matches!(
+            field.kind,
+            CaptureKind::FixedArray | CaptureKind::FixedStruct
+        ) {
             writeln!(
                 bpf_c,
                 "    __builtin_memcpy(&words[{word}], (const char *)ctx + {}, {});",
@@ -291,25 +308,15 @@ fn fixed_fields(format: &str, selected: Option<&[String]>) -> io::Result<Vec<Tra
         return Err(invalid("tracepoint has no event-specific fields"));
     }
     for field in &fields {
-        if field.declaration.contains('*')
-            || field.declaration.contains("__data_loc")
+        if field.declaration.contains("__data_loc")
             || field.declaration.contains("__rel_loc")
             || field.declaration.contains("[]")
         {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!(
-                    "field {} requires an explicit pointer or dynamic-data policy ({})",
+                    "field {} requires bounded dynamic-data capture ({})",
                     field.name, field.declaration
-                ),
-            ));
-        }
-        if field.array_len.is_none() && !matches!(field.size, 1 | 2 | 4 | 8) {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!(
-                    "field {} has unsupported scalar size {}",
-                    field.name, field.size
                 ),
             ));
         }
@@ -398,7 +405,24 @@ fn parse_field(line: &str) -> io::Result<TracepointField> {
         size,
         signed,
         array_len,
+        kind: classify_field(declaration, array_len, size),
     })
+}
+
+fn classify_field(declaration: &str, array_len: Option<usize>, size: usize) -> CaptureKind {
+    if declaration.contains("__rel_loc") {
+        CaptureKind::RelativeDataLoc
+    } else if declaration.contains("__data_loc") || declaration.contains("[]") {
+        CaptureKind::DataLoc
+    } else if declaration.contains('*') {
+        CaptureKind::PointerAddress
+    } else if array_len.is_some() {
+        CaptureKind::FixedArray
+    } else if matches!(size, 1 | 2 | 4 | 8) {
+        CaptureKind::Scalar
+    } else {
+        CaptureKind::FixedStruct
+    }
 }
 
 fn property<'a>(parts: &mut impl Iterator<Item = &'a str>, name: &str) -> io::Result<usize> {
@@ -418,7 +442,10 @@ fn property<'a>(parts: &mut impl Iterator<Item = &'a str>, name: &str) -> io::Re
 }
 
 fn field_words(field: &TracepointField) -> usize {
-    if field.array_len.is_some() {
+    if matches!(
+        field.kind,
+        CaptureKind::FixedArray | CaptureKind::FixedStruct
+    ) {
         field.size.div_ceil(8)
     } else {
         1
@@ -426,8 +453,13 @@ fn field_words(field: &TracepointField) -> usize {
 }
 
 fn rust_type(field: &TracepointField) -> String {
-    if field.array_len.is_some() {
+    if matches!(
+        field.kind,
+        CaptureKind::FixedArray | CaptureKind::FixedStruct
+    ) {
         format!("[u8; {}]", field.size)
+    } else if field.kind == CaptureKind::PointerAddress {
+        "u64".to_owned()
     } else {
         format!("{}{}", if field.signed { 'i' } else { 'u' }, field.size * 8)
     }
@@ -575,6 +607,7 @@ format:
                     signed: true,
                     destination_word: 2,
                     words: 1,
+                    kind: CaptureKind::Scalar,
                 },
                 CaptureField {
                     name: "prev_state".to_owned(),
@@ -583,6 +616,7 @@ format:
                     signed: true,
                     destination_word: 3,
                     words: 1,
+                    kind: CaptureKind::Scalar,
                 },
                 CaptureField {
                     name: "next_pid".to_owned(),
@@ -591,6 +625,7 @@ format:
                     signed: true,
                     destination_word: 4,
                     words: 1,
+                    kind: CaptureKind::Scalar,
                 },
             ]
         );
@@ -635,9 +670,56 @@ format:
     }
 
     #[test]
-    fn rejects_pointer_and_dynamic_fields() {
-        for declaration in ["const char * filename", "__data_loc char[] name"] {
-            let format = format!("field:{declaration}; offset:16; size:8; signed:0;");
+    fn captures_raw_pointers_as_addresses_without_dereferencing() {
+        let format = "field:const void * work; offset:16; size:8; signed:0;";
+        let plan = capture_plan("workqueue", "execute", format, None).unwrap();
+
+        assert_eq!(plan.fields[0].kind, CaptureKind::PointerAddress);
+        assert_eq!(plan.fields[0].words, 1);
+        assert!(!plan.operations().unwrap()[0].signed);
+
+        let generated = generate("workqueue", "execute", format).unwrap();
+        assert!(generated.rust.contains("pub work: u64"));
+        assert!(generated.bpf_c.contains("(const char *)ctx + 16"));
+        assert!(!generated.bpf_c.contains("probe_read"));
+        compile_generated_rust(&generated.rust);
+    }
+
+    #[test]
+    fn captures_unknown_fixed_structs_as_bytes_across_words() {
+        let format = "field:struct example value; offset:16; size:13; signed:0;";
+        let plan = capture_plan("example", "fixed_struct", format, None).unwrap();
+
+        assert_eq!(plan.fields[0].kind, CaptureKind::FixedStruct);
+        assert_eq!(plan.fields[0].words, 2);
+        assert_eq!(
+            plan.operations().unwrap(),
+            [
+                CaptureOperation {
+                    source_offset: 16,
+                    size: 8,
+                    destination_word: 2,
+                    signed: false,
+                },
+                CaptureOperation {
+                    source_offset: 24,
+                    size: 5,
+                    destination_word: 3,
+                    signed: false,
+                },
+            ]
+        );
+
+        let generated = generate("example", "fixed_struct", format).unwrap();
+        assert!(generated.rust.contains("pub value: [u8; 13]"));
+        assert!(generated.bpf_c.contains("__builtin_memcpy(&words[2]"));
+        compile_generated_rust(&generated.rust);
+    }
+
+    #[test]
+    fn still_rejects_dynamic_locations_until_bounded_capture_exists() {
+        for declaration in ["__data_loc char[] name", "__rel_loc char[] name"] {
+            let format = format!("field:{declaration}; offset:16; size:4; signed:0;");
             assert_eq!(
                 generate("x", "y", &format).unwrap_err().kind(),
                 io::ErrorKind::Unsupported

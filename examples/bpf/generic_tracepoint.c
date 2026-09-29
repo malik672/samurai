@@ -51,7 +51,8 @@ capture_one(void *ctx, u32 index, u64 *captured) {
     if (!operation) return 0;
     u64 value = 0;
     unsigned short size = operation->size;
-    if (size != 1 && size != 2 && size != 4 && size != 8) return 0;
+    /* A fixed byte field may end with a partial word of any size from 1..=8. */
+    if (size == 0 || size > sizeof(value)) return 0;
     if (probe_read_kernel(&value, size,
                           (const char *)ctx + operation->source_offset) < 0)
         return 0;

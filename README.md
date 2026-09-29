@@ -189,11 +189,12 @@ sudo cat /sys/kernel/tracing/events/sched/sched_switch/format |
     sched sched_switch target/generated-minimal
 ```
 
-The generator includes a timestamp and CPU, maps fixed scalars and arrays from
-their kernel-provided offsets, calculates a power-of-two lane capacity within a
-64 MiB total transport budget, and emits `mold_record!` code. It deliberately
-rejects pointers and `__data_loc` fields because those need an explicit bounded
-read policy like the pathname policy in the `openat` example.
+The generator includes a timestamp and CPU, maps fixed scalars, arrays, raw
+pointers, and inline structs from their kernel-provided offsets, calculates a
+power-of-two lane capacity within a 64 MiB total transport budget, and emits
+`mold_record!` code. Raw pointers are captured only as integer addresses; the
+generic path never dereferences them. Dynamic locations remain rejected until
+their bounded output size is part of the capture plan.
 
 The same validation is available without invoking a compiler. At startup,
 Samurai can discover a capture plan directly from the running kernel:
@@ -208,9 +209,11 @@ let plan = samurai::tracepoint_schema::CapturePlan::discover(
 )?;
 ```
 
-Each plan fixes the source offset, byte width, signedness, destination Mold
-word, record width, and required tracepoint-context span. Dynamic data and
-pointers remain policy inputs rather than being guessed from kernel metadata.
+Each plan fixes the capture kind, source offset, byte width, signedness,
+destination Mold word, record width, and required tracepoint-context span.
+Unknown fixed-size inline declarations are preserved as bytes. Dereferencing a
+pointer remains an explicit event policy rather than something inferred from
+kernel metadata.
 
 The prebuilt generic reader executes that plan without a runtime compiler. For
 example, record three fixed `sched_switch` fields from the current kernel:
@@ -226,9 +229,9 @@ sudo ./target/release/examples/generic_tracepoint \
 ```
 
 At startup, userspace lowers selected fields into at most 32 bounded copy
-operations and installs them in BPF array maps. The BPF program accepts only
-1-, 2-, 4-, and 8-byte reads, uses a fixed 34-word Mold ABI, and never
-interprets an unannotated pointer.
+operations and installs them in BPF array maps. Each operation copies one to
+eight bytes, allowing the final partial word of an inline struct. The program
+uses a fixed 34-word Mold ABI and never interprets an unannotated pointer.
 
 ### Reproducible transport comparison
 
