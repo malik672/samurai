@@ -39,6 +39,12 @@ fn main() -> io::Result<()> {
 
     let loaded = ObjectLoader::from_file(&args[0])?.load()?;
     let mut config = [0_u8; 8];
+    let pathname_offset = u32::try_from(pathname_offset).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "openat filename offset does not fit the BPF test ABI",
+        )
+    })?;
     config[..4].copy_from_slice(&std::process::id().to_ne_bytes());
     config[4..].copy_from_slice(&pathname_offset.to_ne_bytes());
     loaded
