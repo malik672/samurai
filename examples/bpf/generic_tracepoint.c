@@ -9,10 +9,12 @@
 #define CAPTURE_DATA_LOC 2U
 #define CAPTURE_RELATIVE 4U
 #define CAPTURE_DYNAMIC_METADATA 8U
+#define CAPTURE_USER_STRING 16U
 
 static u64 (*const ktime_get_ns)(void) = (void *)5;
 static u64 (*const get_smp_processor_id)(void) = (void *)8;
 static long (*const probe_read_kernel)(void *, u32, const void *) = (void *)113;
+static long (*const probe_read_user_str)(void *, u32, const void *) = (void *)114;
 
 struct capture_operation {
     u32 source_offset;
@@ -78,13 +80,74 @@ read_fixed(void *ctx, u32 source_offset, unsigned short size, u64 *value) {
     }
 }
 
+#define DEFINE_USER_STRING(word)                                                \
+    static __attribute__((noinline)) long read_user_string_##word(              \
+        void *ctx, u32 source_offset, u32 pointer_size,                         \
+        struct capture_scratch *scratch) {                                      \
+        u64 pointer = 0;                                                        \
+        if (read_fixed(ctx, source_offset, (unsigned short)pointer_size,         \
+                       &pointer) < 0)                                           \
+            return -1;                                                         \
+        __builtin_memset(&scratch->words[(word) + 1], 0, 128);                  \
+        return probe_read_user_str(&scratch->words[(word) + 1], 128,            \
+                                   (const void *)pointer);                      \
+    }
+DEFINE_USER_STRING(2)
+DEFINE_USER_STRING(3)
+DEFINE_USER_STRING(4)
+DEFINE_USER_STRING(5)
+DEFINE_USER_STRING(6)
+DEFINE_USER_STRING(7)
+DEFINE_USER_STRING(8)
+DEFINE_USER_STRING(9)
+DEFINE_USER_STRING(10)
+DEFINE_USER_STRING(11)
+DEFINE_USER_STRING(12)
+DEFINE_USER_STRING(13)
+DEFINE_USER_STRING(14)
+DEFINE_USER_STRING(15)
+DEFINE_USER_STRING(16)
+DEFINE_USER_STRING(17)
+#undef DEFINE_USER_STRING
+
+static __attribute__((always_inline)) long
+read_user_string(void *ctx, struct capture_operation *operation,
+                 struct capture_scratch *scratch) {
+    switch (operation->destination_word) {
+    case 2: return read_user_string_2(ctx, operation->source_offset, operation->data_offset, scratch);
+    case 3: return read_user_string_3(ctx, operation->source_offset, operation->data_offset, scratch);
+    case 4: return read_user_string_4(ctx, operation->source_offset, operation->data_offset, scratch);
+    case 5: return read_user_string_5(ctx, operation->source_offset, operation->data_offset, scratch);
+    case 6: return read_user_string_6(ctx, operation->source_offset, operation->data_offset, scratch);
+    case 7: return read_user_string_7(ctx, operation->source_offset, operation->data_offset, scratch);
+    case 8: return read_user_string_8(ctx, operation->source_offset, operation->data_offset, scratch);
+    case 9: return read_user_string_9(ctx, operation->source_offset, operation->data_offset, scratch);
+    case 10: return read_user_string_10(ctx, operation->source_offset, operation->data_offset, scratch);
+    case 11: return read_user_string_11(ctx, operation->source_offset, operation->data_offset, scratch);
+    case 12: return read_user_string_12(ctx, operation->source_offset, operation->data_offset, scratch);
+    case 13: return read_user_string_13(ctx, operation->source_offset, operation->data_offset, scratch);
+    case 14: return read_user_string_14(ctx, operation->source_offset, operation->data_offset, scratch);
+    case 15: return read_user_string_15(ctx, operation->source_offset, operation->data_offset, scratch);
+    case 16: return read_user_string_16(ctx, operation->source_offset, operation->data_offset, scratch);
+    case 17: return read_user_string_17(ctx, operation->source_offset, operation->data_offset, scratch);
+    default: return -1;
+    }
+}
+
 static __attribute__((always_inline)) int
-capture_one(void *ctx, u32 index, u64 *captured) {
+capture_one(void *ctx, u32 index, struct capture_scratch *scratch, u64 *captured) {
     struct capture_operation *operation =
         map_lookup_elem(&capture_operations, &index);
     if (!operation) return 0;
     u64 value = 0;
     unsigned short size = operation->size;
+    if (operation->flags & CAPTURE_USER_STRING) {
+        long result = read_user_string(ctx, operation, scratch);
+        u32 length = result > 0 ? (u32)(result - 1) : 0;
+        u32 error = result < 0 ? (u32)result : 0;
+        *captured = ((u64)error << 32) | length;
+        return 1;
+    }
     if (operation->flags & CAPTURE_DATA_LOC) {
         u64 locator_word = 0;
         if (read_4(ctx, operation->source_offset, &locator_word) < 0)
@@ -174,7 +237,7 @@ int record_generic_tracepoint(void *ctx) {
 #define CAPTURE_INDEX(index, word)                                             \
     if (operation_count > (index)) {                                           \
         u64 captured;                                                          \
-        if (!capture_one(ctx, (index), &captured)) return 0;                   \
+        if (!capture_one(ctx, (index), scratch, &captured)) return 0;          \
         store_word_##word(scratch, captured);                                  \
     }
     CAPTURE_INDEX(0, 2);

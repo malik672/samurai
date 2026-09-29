@@ -11,6 +11,7 @@ const CAPTURE_SIGNED: u32 = 1 << 0;
 const CAPTURE_DATA_LOC: u32 = 1 << 1;
 const CAPTURE_RELATIVE: u32 = 1 << 2;
 const CAPTURE_DYNAMIC_METADATA: u32 = 1 << 3;
+const CAPTURE_USER_STRING: u32 = 1 << 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureKind {
@@ -21,6 +22,69 @@ pub enum CaptureKind {
     FunctionPointer,
     DataLoc,
     RelativeDataLoc,
+    UserString,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PointerCapture {
+    Address,
+    UserString { max_len: usize },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CapturePolicy {
+    pub category: &'static str,
+    pub event: &'static str,
+    pub field: &'static str,
+    pub capture: PointerCapture,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PolicyRegistry {
+    policies: &'static [CapturePolicy],
+}
+
+const BUILTIN_POLICIES: &[CapturePolicy] = &[CapturePolicy {
+    category: "syscalls",
+    event: "sys_enter_openat",
+    field: "filename",
+    capture: PointerCapture::UserString { max_len: 128 },
+}];
+
+impl PolicyRegistry {
+    pub const fn builtin() -> Self {
+        Self {
+            policies: BUILTIN_POLICIES,
+        }
+    }
+
+    pub const fn empty() -> Self {
+        Self { policies: &[] }
+    }
+
+    pub const fn from_static(policies: &'static [CapturePolicy]) -> Self {
+        Self { policies }
+    }
+
+    fn capture_for(
+        self,
+        category: &str,
+        event: &str,
+        field: &TracepointField,
+    ) -> io::Result<PointerCapture> {
+        let Some(policy) = self.policies.iter().find(|policy| {
+            policy.category == category && policy.event == event && policy.field == field.name
+        }) else {
+            return Ok(PointerCapture::Address);
+        };
+        if field.kind != CaptureKind::PointerAddress {
+            return Err(invalid(format!(
+                "policy for {category}:{event}.{} requires a pointer, running kernel declares {}",
+                field.name, field.declaration
+            )));
+        }
+        Ok(policy.capture)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -112,13 +176,38 @@ impl CapturePlan {
         dynamic_capture_bytes: usize,
     ) -> io::Result<Self> {
         let format = resolver.format(category, event)?;
-        capture_plan_bounded(category, event, &format, selected, dynamic_capture_bytes)
+        capture_plan_with_registry(
+            category,
+            event,
+            &format,
+            selected,
+            dynamic_capture_bytes,
+            PolicyRegistry::builtin(),
+        )
     }
 
     /// Lower fields into bounded operations understood by the generic BPF reader.
     pub fn operations(&self) -> io::Result<Vec<CaptureOperation>> {
         let mut operations = Vec::new();
         for field in &self.fields {
+            if field.kind == CaptureKind::UserString {
+                if field.capture_size != 128 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "generic BPF reader currently supports 128-byte user strings",
+                    ));
+                }
+                operations.push(CaptureOperation {
+                    source_offset: u32::try_from(field.source_offset).map_err(|_| {
+                        io::Error::new(io::ErrorKind::Unsupported, "tracepoint offset exceeds u32")
+                    })?,
+                    size: 128,
+                    destination_word: u16::try_from(field.destination_word).unwrap(),
+                    flags: CAPTURE_USER_STRING,
+                    data_offset: u32::try_from(field.size).unwrap(),
+                });
+                continue;
+            }
             if matches!(
                 field.kind,
                 CaptureKind::DataLoc | CaptureKind::RelativeDataLoc
@@ -212,6 +301,24 @@ pub fn capture_plan_bounded(
     selected: Option<&[String]>,
     dynamic_capture_bytes: usize,
 ) -> io::Result<CapturePlan> {
+    capture_plan_with_registry(
+        category,
+        event,
+        format,
+        selected,
+        dynamic_capture_bytes,
+        PolicyRegistry::empty(),
+    )
+}
+
+pub fn capture_plan_with_registry(
+    category: &str,
+    event: &str,
+    format: &str,
+    selected: Option<&[String]>,
+    dynamic_capture_bytes: usize,
+    policies: PolicyRegistry,
+) -> io::Result<CapturePlan> {
     validate_identifier(category, "category")?;
     validate_identifier(event, "event")?;
     if dynamic_capture_bytes == 0 {
@@ -221,8 +328,14 @@ pub fn capture_plan_bounded(
     let mut destination_word = MOLD_METADATA_WORDS;
     let mut captures = Vec::with_capacity(fields.len());
     let mut context_size = 0;
-    for field in fields {
-        let capture_size = if matches!(
+    for mut field in fields {
+        let pointer_capture = policies.capture_for(category, event, &field)?;
+        if let PointerCapture::UserString { .. } = pointer_capture {
+            field.kind = CaptureKind::UserString;
+        }
+        let capture_size = if let PointerCapture::UserString { max_len } = pointer_capture {
+            max_len
+        } else if matches!(
             field.kind,
             CaptureKind::DataLoc | CaptureKind::RelativeDataLoc
         ) {
@@ -417,10 +530,14 @@ fn fixed_fields(format: &str, selected: Option<&[String]>) -> io::Result<Vec<Tra
 }
 
 fn selected_fields(format: &str, selected: Option<&[String]>) -> io::Result<Vec<TracepointField>> {
-    let available: Vec<_> = parse_format(format)?
-        .into_iter()
-        .filter(|field| !field.name.starts_with("common_"))
-        .collect();
+    let all = parse_format(format)?;
+    let available: Vec<_> = if selected.is_some() {
+        all
+    } else {
+        all.into_iter()
+            .filter(|field| !field.name.starts_with("common_"))
+            .collect()
+    };
     let fields = match selected {
         Some(selected) => select_fields(&available, selected)?,
         None => available,
@@ -884,6 +1001,57 @@ format:
                 ]
             );
         }
+    }
+
+    #[test]
+    fn builtin_openat_policy_validates_and_lowers_user_string() {
+        let format = r#"
+field:unsigned short common_type; offset:0; size:2; signed:0;
+field:int common_pid; offset:4; size:4; signed:1;
+field:int dfd; offset:16; size:8; signed:1;
+field:const char * filename; offset:24; size:8; signed:0;
+field:int flags; offset:32; size:8; signed:0;
+"#;
+        let selected = ["common_pid".to_owned(), "filename".to_owned()];
+        let plan = capture_plan_with_registry(
+            "syscalls",
+            "sys_enter_openat",
+            format,
+            Some(&selected),
+            DEFAULT_DYNAMIC_CAPTURE_BYTES,
+            PolicyRegistry::builtin(),
+        )
+        .unwrap();
+
+        assert_eq!(plan.words, 20);
+        assert_eq!(plan.fields[1].kind, CaptureKind::UserString);
+        assert_eq!(plan.fields[1].capture_size, 128);
+        assert_eq!(
+            plan.operations().unwrap()[1],
+            CaptureOperation {
+                source_offset: 24,
+                size: 128,
+                destination_word: 3,
+                flags: CAPTURE_USER_STRING,
+                data_offset: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn policy_rejects_a_running_kernel_field_that_is_no_longer_a_pointer() {
+        let format = "field:char filename[16]; offset:16; size:16; signed:0;";
+        let error = capture_plan_with_registry(
+            "syscalls",
+            "sys_enter_openat",
+            format,
+            None,
+            DEFAULT_DYNAMIC_CAPTURE_BYTES,
+            PolicyRegistry::builtin(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("requires a pointer"));
     }
 
     fn compile_generated_rust(source: &str) {

@@ -130,21 +130,23 @@ another fixed-size event requires its Rust record and schema declaration plus a
 BPF handler that writes fields in the declared order. The lane, mark, gap, and
 retention protocol remains unchanged.
 
-`openat` is the second complete event implementation and uses the library's
-generic mapped-lane reader:
+`openat` is the first semantic-policy example. The running kernel supplies its
+field layout, while the built-in registry validates `filename` as a pointer and
+changes its default address capture to `UserString { max_len: 128 }`:
 
 ```sh
 clang -target bpfel -mcpu=v3 -O2 -I examples/bpf \
-  -c examples/bpf/openat.c \
-  -o target/openat.bpf.o
-cargo build --release --example openat
-sudo ./target/release/examples/openat target/openat.bpf.o 5
+  -c examples/bpf/generic_tracepoint.c \
+  -o target/generic-tracepoint.bpf.o
+cargo build --release --example generic_tracepoint
+sudo ./target/release/examples/generic_tracepoint \
+  target/generic-tracepoint.bpf.o \
+  syscalls sys_enter_openat common_pid,dfd,filename,flags,mode 5
 ```
 
-The example attaches to `syscalls:sys_enter_openat`, uses the same bounded
-user-string helper as Aya to capture up to 63 pathname bytes, reads every CPU
-lane as typed `OpenAtRecord` values, and reports exact gaps. Its 64K-slot lanes
-reserve about 72 MiB for the wider path-bearing records.
+The generic reader captures up to 127 pathname bytes plus the terminator and
+reports helper errors separately from empty strings. No handwritten openat BPF
+producer or record layout remains.
 
 The privileged helper compatibility test adapts Aya's normal, truncation,
 empty-string, and invalid-pointer cases and verifies them through Mold:
@@ -152,15 +154,12 @@ empty-string, and invalid-pointer cases and verifies them through Mold:
 ```sh
 clang -target bpfel -mcpu=v3 -O2 -I examples/bpf \
   -DMOLD_CAPACITY=1024 \
-  -c examples/bpf/openat.c \
-  -o target/openat-helper-test.bpf.o
+  -c examples/bpf/generic_tracepoint.c \
+  -o target/generic-tracepoint.bpf.o
 cargo build --release --example openat_helper_test
 sudo ./target/release/examples/openat_helper_test \
-  target/openat-helper-test.bpf.o
+  target/generic-tracepoint.bpf.o
 ```
-
-`OpenAtRecord::path_error` preserves a negative helper result, keeping an empty
-pathname distinct from an unreadable user pointer.
 
 ### Generate a tracepoint schema
 

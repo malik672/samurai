@@ -93,7 +93,21 @@ fn print_record(plan: &CapturePlan, words: &[u64; GENERIC_CAPTURE_WORDS]) {
     print!("{} CPU {}", words[0], words[1]);
     for field in &plan.fields {
         let values = &words[field.destination_word..field.destination_word + field.words];
-        if matches!(
+        if field.kind == CaptureKind::UserString {
+            let length = values[0] as u32 as usize;
+            let error = (values[0] >> 32) as u32 as i32;
+            print!(" {}=\"", field.name);
+            for index in 0..length {
+                let byte = values[1 + index / 8].to_ne_bytes()[index % 8];
+                for escaped in byte.escape_ascii() {
+                    print!("{}", escaped as char);
+                }
+            }
+            print!("\"");
+            if error != 0 {
+                print!("(error {error})");
+            }
+        } else if matches!(
             field.kind,
             CaptureKind::DataLoc | CaptureKind::RelativeDataLoc
         ) {

@@ -3,13 +3,11 @@
 //! 8bcb4e390fde09ffd8d7e8c060e473c03d9b6601 (MIT; see LICENSES/aya-MIT.txt).
 use samurai::{
     bpf::object::ObjectLoader,
-    mold::{MappedMold, TypedMoldEntry},
-    record::OpenAtRecord,
+    mold::{MappedMold, MoldEntry},
+    tracepoint_schema::{CaptureKind, CapturePlan, GENERIC_CAPTURE_WORDS},
     utils::{affinity::pin_current_thread, tracepoint::TracepointResolver},
 };
 use std::{collections::BTreeMap, ffi::CString, io};
-
-const WORDS: usize = 16;
 
 fn main() -> io::Result<()> {
     // The legacy tracepoint perf event is opened on CPU 0. Keep this focused
@@ -19,10 +17,43 @@ fn main() -> io::Result<()> {
     let object = std::env::args().nth(1).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: openat_helper_test <openat-test.bpf.o>",
+            "usage: openat_helper_test <generic-tracepoint.bpf.o>",
         )
     })?;
+    let resolver = TracepointResolver::new();
+    let fields = ["common_pid".to_owned(), "filename".to_owned()];
+    let plan = CapturePlan::discover(&resolver, "syscalls", "sys_enter_openat", Some(&fields))?;
+    let filename = plan
+        .fields
+        .iter()
+        .find(|field| field.name == "filename")
+        .ok_or_else(|| missing("filename capture field"))?;
+    if filename.kind != CaptureKind::UserString {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "openat filename policy was not applied",
+        ));
+    }
+    let pid_word = plan
+        .fields
+        .iter()
+        .find(|field| field.name == "common_pid")
+        .ok_or_else(|| missing("common_pid capture field"))?
+        .destination_word;
+    let filename_word = filename.destination_word;
+    let operations = plan.operations()?;
+
     let loaded = ObjectLoader::from_file(object)?.load()?;
+    loaded
+        .map("capture_config")
+        .ok_or_else(|| missing("capture_config"))?
+        .write(0, &(operations.len() as u64).to_ne_bytes())?;
+    let operation_map = loaded
+        .map("capture_operations")
+        .ok_or_else(|| missing("capture_operations"))?;
+    for (index, operation) in operations.iter().enumerate() {
+        operation_map.write(index as u32, &operation.to_bytes())?;
+    }
     let wanted_pid = std::process::id();
     let slots = loaded
         .map("slots")
@@ -32,14 +63,14 @@ fn main() -> io::Result<()> {
         .map("frontiers")
         .ok_or_else(|| missing("frontiers"))?
         .mmap()?;
-    let mold = MappedMold::<WORDS>::new(&slots, &frontiers)?;
+    let mold = MappedMold::<GENERIC_CAPTURE_WORDS>::new(&slots, &frontiers)?;
     let mut workers = (0..mold.lanes())
         .map(|lane| mold.worker(lane))
         .collect::<io::Result<Vec<_>>>()?;
     let program = loaded
-        .program("record_openat")
-        .ok_or_else(|| missing("record_openat"))?;
-    let attachment = program.attach(&TracepointResolver::new(), "syscalls", "sys_enter_openat")?;
+        .program("record_generic_tracepoint")
+        .ok_or_else(|| missing("record_generic_tracepoint"))?;
+    let attachment = program.attach(&resolver, "syscalls", "sys_enter_openat")?;
 
     call_openat(CString::new("/dev/null").unwrap().as_ptr());
     let long = CString::new(vec![b'a'; 128]).unwrap();
@@ -54,19 +85,29 @@ fn main() -> io::Result<()> {
     loop {
         let mut progressed = false;
         for worker in &mut workers {
-            match worker.try_next_record::<OpenAtRecord>()? {
-                Some(TypedMoldEntry::Data(record)) => {
-                    *observed_pids.entry(record.pid).or_default() += 1;
-                    if record.pid == wanted_pid {
-                        records.push(record);
+            match worker.try_next()? {
+                Some(MoldEntry::Data(words)) => {
+                    let pid = words[pid_word] as u32;
+                    *observed_pids.entry(pid).or_default() += 1;
+                    if pid == wanted_pid {
+                        let metadata = words[filename_word];
+                        let length = metadata as u32 as usize;
+                        let error = (metadata >> 32) as u32 as i32;
+                        let mut path = Vec::with_capacity(length);
+                        for index in 0..length {
+                            path.push(
+                                words[filename_word + 1 + index / 8].to_ne_bytes()[index % 8],
+                            );
+                        }
+                        records.push((path, error));
                     }
                     progressed = true;
                 }
-                Some(TypedMoldEntry::Gap(missed)) => {
+                Some(MoldEntry::Gap(missed)) => {
                     gaps += missed;
                     progressed = true;
                 }
-                Some(TypedMoldEntry::Done) => progressed = true,
+                Some(MoldEntry::Done) => progressed = true,
                 None => {}
             }
         }
@@ -81,24 +122,23 @@ fn main() -> io::Result<()> {
             break;
         }
     }
-    records.sort_unstable_by_key(|record| record.timestamp_ns);
     assert_eq!(gaps, 0, "helper test must not lose records");
     assert_eq!(
         records.len(),
         4,
         "expected exactly four openat calls for pid {wanted_pid}; observed records by pid: {observed_pids:?}"
     );
-    assert_eq!(records[0].path_bytes(), b"/dev/null");
-    assert_eq!(records[0].path_error, 0);
-    assert_eq!(records[1].path_bytes(), &[b'a'; 63]);
-    assert_eq!(records[1].path_error, 0);
-    assert_eq!(records[2].path_bytes(), b"");
-    assert_eq!(records[2].path_error, 0);
-    assert_eq!(records[3].path_bytes(), b"");
-    assert!(records[3].path_error < 0);
+    assert_eq!(records[0].0, b"/dev/null");
+    assert_eq!(records[0].1, 0);
+    assert_eq!(records[1].0, &[b'a'; 127]);
+    assert_eq!(records[1].1, 0);
+    assert_eq!(records[2].0, b"");
+    assert_eq!(records[2].1, 0);
+    assert_eq!(records[3].0, b"");
+    assert!(records[3].1 < 0);
     println!(
         "openat helper cases passed: normal, truncated, empty, invalid-pointer error={}",
-        records[3].path_error
+        records[3].1
     );
     Ok(())
 }
