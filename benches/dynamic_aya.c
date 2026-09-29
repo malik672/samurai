@@ -10,10 +10,13 @@ __attribute__((section("maps"), used))
 struct map_def DYNAMIC_DROPPED = {6, sizeof(u32), sizeof(u64), 1, 0};
 __attribute__((section("maps"), used))
 struct map_def DYNAMIC_CONFIG = {2, sizeof(u32), sizeof(struct config), 1, 0};
+__attribute__((section("maps"), used))
+struct map_def DYNAMIC_CPU = {2, sizeof(u32), sizeof(u32), 1, 0};
 
 static void *(*const map_lookup_elem)(void *, const void *) = (void *)1;
 static u64 (*const ktime_get_ns)(void) = (void *)5;
 static u64 (*const get_current_pid_tgid)(void) = (void *)14;
+static u32 (*const get_smp_processor_id)(void) = (void *)8;
 static long (*const probe_read_kernel)(void *, u32, const void *) = (void *)113;
 static long (*const probe_read_user)(void *, u32, const void *) = (void *)112;
 static long (*const probe_read_user_str)(void *, u32, const void *) = (void *)114;
@@ -28,7 +31,9 @@ static __attribute__((always_inline)) void increment_drop(void) {
 static __attribute__((always_inline)) int emit(void *ctx, u32 mode) {
     u32 zero = 0;
     struct config *cfg = map_lookup_elem(&DYNAMIC_CONFIG, &zero);
-    if (!cfg || cfg->pid != (u32)(get_current_pid_tgid() >> 32) || cfg->mode != mode)
+    u32 *cpu = map_lookup_elem(&DYNAMIC_CPU, &zero);
+    if (!cfg || !cpu || *cpu != get_smp_processor_id() ||
+        cfg->pid != (u32)(get_current_pid_tgid() >> 32) || cfg->mode != mode)
         return 0;
     u64 pointer = 0;
     if (probe_read_kernel(&pointer, 8, (char *)ctx + cfg->pointer_offset) < 0)
