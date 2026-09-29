@@ -50,9 +50,11 @@ pub fn open_tracepoint(tracepoint_id: u64) -> io::Result<OwnedFd> {
     open_tracepoint_for(tracepoint_id, -1, 0)
 }
 
-/// Open the perf event for one Linux thread on any CPU.
-pub fn open_tracepoint_for_thread(tracepoint_id: u64, tid: u32) -> io::Result<OwnedFd> {
-    open_tracepoint_for(tracepoint_id, tid as i32, -1)
+/// Open the perf event for all tasks executing on one CPU.
+pub fn open_tracepoint_on_cpu(tracepoint_id: u64, cpu: usize) -> io::Result<OwnedFd> {
+    let cpu = i32::try_from(cpu)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "CPU ID exceeds i32"))?;
+    open_tracepoint_for(tracepoint_id, -1, cpu)
 }
 
 fn open_tracepoint_for(tracepoint_id: u64, pid: i32, cpu: i32) -> io::Result<OwnedFd> {

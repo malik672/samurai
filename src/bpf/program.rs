@@ -35,16 +35,16 @@ impl TracePoint {
         Ok(perf_fd)
     }
 
-    /// Attach this program to one Linux thread, wherever that thread runs.
-    pub fn attach_to_thread(
+    /// Attach this program for all tasks executing on one CPU.
+    pub fn attach_to_cpu(
         &self,
         resolver: &TracepointResolver,
         category: &str,
         name: &str,
-        tid: u32,
+        cpu: usize,
     ) -> io::Result<OwnedFd> {
         let tracepoint = resolver.open(category, name)?;
-        let perf_fd = event::open_tracepoint_for_thread(tracepoint.id, tid)?;
+        let perf_fd = event::open_tracepoint_on_cpu(tracepoint.id, cpu)?;
         event::attach_bpf(&perf_fd, &self.fd)?;
         event::enable_event(&perf_fd)?;
         Ok(perf_fd)

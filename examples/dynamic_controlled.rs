@@ -137,10 +137,12 @@ fn main() -> io::Result<()> {
     }
 
     let stop = AtomicBool::new(false);
-    let abort = AtomicBool::new(false);
     let start =
         Barrier::new(producer_cpus.len() + consumer_cpus.len().min(producer_cpus.len()) + 1);
-    let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+    let _attachments = producer_cpus
+        .iter()
+        .map(|&cpu| program.attach_to_cpu(&resolver, "syscalls", event, cpu))
+        .collect::<io::Result<Vec<_>>>()?;
     let path = CString::new("/dev/null").unwrap();
     let sink = File::options().write(true).open("/dev/null")?;
     let payload = [0x5au8; 128];
@@ -171,17 +173,9 @@ fn main() -> io::Result<()> {
                 let path = &path;
                 let sink = &sink;
                 let payload = &payload;
-                let tid_tx = tid_tx.clone();
-                let abort = &abort;
                 scope.spawn(move || -> io::Result<()> {
                     pin_current_thread(cpu)?;
-                    tid_tx
-                        .send(unsafe { libc::syscall(libc::SYS_gettid) as u32 })
-                        .map_err(|_| io::Error::other("TID receiver closed"))?;
                     start.wait();
-                    if abort.load(Ordering::Acquire) {
-                        return Ok(());
-                    }
                     for _ in 0..calls {
                         if mode_id == 1 {
                             let fd = unsafe {
@@ -211,15 +205,6 @@ fn main() -> io::Result<()> {
                 })
             })
             .collect();
-        drop(tid_tx);
-        let attachments = tid_rx
-            .iter()
-            .map(|tid| program.attach_to_thread(&resolver, "syscalls", event, tid))
-            .collect::<io::Result<Vec<_>>>();
-        if attachments.is_err() {
-            abort.store(true, Ordering::Release);
-            stop.store(true, Ordering::Release);
-        }
         let wall = Instant::now();
         start.wait();
         for producer in producers {
@@ -236,7 +221,6 @@ fn main() -> io::Result<()> {
                     .map_err(|_| io::Error::other("consumer panicked"))??,
             );
         }
-        attachments?;
         Ok(())
     })?;
     let received: u64 = results.iter().map(|r| r.received).sum();
