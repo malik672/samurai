@@ -165,6 +165,22 @@ The optional final argument selects the CPU for the entire test process. It
 defaults to CPU 0 and is applied before discovery, loading, attachment, and the
 four target syscalls.
 
+Aya's kernel-pointer fixture is also adapted to test the remaining pointer
+capture primitives with exact byte comparisons:
+
+```sh
+clang -target bpfel -mcpu=v3 -O2 -Wall -Wextra -Werror \
+  -c examples/bpf/pointer_helpers_test.c \
+  -o target/pointer-helpers-test.bpf.o
+cargo build --release --example pointer_helpers_test
+sudo ./target/release/examples/pointer_helpers_test \
+  target/pointer-helpers-test.bpf.o 0
+```
+
+The test uses an array-map value as a real kernel pointer and checks user bytes,
+kernel bytes, and normal, truncated, and empty kernel strings. The pathname
+offset still comes from the running kernel's tracepoint format.
+
 ### Generate a tracepoint schema
 
 Samurai can turn Linux's authoritative tracepoint format into a fixed Mold BPF

@@ -73,6 +73,20 @@ impl ArrayMap {
         unsafe { syscall::lookup_u64(self.fd.as_fd(), index) }
     }
 
+    /// Read one array value into caller-owned storage.
+    pub fn read(&self, index: u32, value: &mut [u8]) -> io::Result<()> {
+        if self.obj.key_size() != 4
+            || value.len() != self.obj.value_size() as usize
+            || index >= self.obj.max_entries()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "array lookup requires a four-byte key, exact value size, and an in-range index",
+            ));
+        }
+        syscall::lookup_map_bytes(self.fd.as_fd(), &index.to_ne_bytes(), value)
+    }
+
     pub fn write(&self, index: u32, value: &[u8]) -> io::Result<()> {
         if self.obj.key_size() != 4
             || value.len() != self.obj.value_size() as usize
