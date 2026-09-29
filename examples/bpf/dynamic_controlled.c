@@ -20,11 +20,14 @@ static long (*const probe_read_kernel)(void *, u32, const void *) = (void *)113;
 static long (*const probe_read_user)(void *, u32, const void *) = (void *)112;
 static long (*const probe_read_user_str)(void *, u32, const void *) = (void *)114;
 
-static __attribute__((always_inline)) int emit(void *ctx, u32 expected_mode) {
+static __attribute__((always_inline)) int emit(void *ctx, u32 expected_mode,
+                                                u32 expected_cpu) {
     u32 zero = 0;
     struct config *cfg = map_lookup_elem(&config, &zero);
     u64 pid_tgid = get_current_pid_tgid();
-    if (!cfg || !cfg->enabled || cfg->pid != (u32)(pid_tgid >> 32) ||
+    u32 cpu = (u32)get_smp_processor_id();
+    if (cpu != expected_cpu || !cfg || !cfg->enabled ||
+        cfg->pid != (u32)(pid_tgid >> 32) ||
         cfg->mode != expected_mode)
         return 0;
     u64 pointer = 0, length = 128;
@@ -38,15 +41,24 @@ static __attribute__((always_inline)) int emit(void *ctx, u32 expected_mode) {
         ? probe_read_user_str(&words[3], 128, (void *)pointer)
         : probe_read_user(&words[3], 128, (void *)pointer);
     words[2] = (u64)result;
-    mold_publish((u32)get_smp_processor_id(), words);
+    mold_publish(cpu, words);
     return 0;
 }
 
-__attribute__((section("tracepoint/syscalls/sys_enter_openat"), used))
-int controlled_string(void *ctx) { return emit(ctx, 1); }
+#define CPU_PROGRAM(cpu)                                                        \
+    __attribute__((section("tracepoint/syscalls/sys_enter_openat"), used))     \
+    int controlled_string_cpu##cpu(void *ctx) { return emit(ctx, 1, cpu); }     \
+    __attribute__((section("tracepoint/syscalls/sys_enter_write"), used))      \
+    int controlled_bytes_cpu##cpu(void *ctx) { return emit(ctx, 2, cpu); }
 
-__attribute__((section("tracepoint/syscalls/sys_enter_write"), used))
-int controlled_bytes(void *ctx) { return emit(ctx, 2); }
+CPU_PROGRAM(0)
+CPU_PROGRAM(1)
+CPU_PROGRAM(2)
+CPU_PROGRAM(3)
+CPU_PROGRAM(4)
+CPU_PROGRAM(5)
+CPU_PROGRAM(6)
+CPU_PROGRAM(7)
 
 __attribute__((section("license"), used))
 char program_license[] = "GPL";

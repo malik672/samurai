@@ -98,9 +98,6 @@ fn main() -> io::Result<()> {
         .map("frontiers")
         .ok_or_else(|| missing("frontiers"))?;
     let config = loaded.map("config").ok_or_else(|| missing("config"))?;
-    let program = loaded
-        .program(program_name)
-        .ok_or_else(|| missing(program_name))?;
     let mut config_value = [0u8; 20];
     config_value[..4].copy_from_slice(&std::process::id().to_ne_bytes());
     config_value[4..8].copy_from_slice(&pointer_offset.to_ne_bytes());
@@ -139,7 +136,16 @@ fn main() -> io::Result<()> {
     let stop = AtomicBool::new(false);
     let start =
         Barrier::new(producer_cpus.len() + consumer_cpus.len().min(producer_cpus.len()) + 1);
-    let _attachment = program.attach_to_cpu(&resolver, "syscalls", event, producer_cpus[0])?;
+    let _attachments = producer_cpus
+        .iter()
+        .map(|&cpu| {
+            let name = format!("{program_name}_cpu{cpu}");
+            loaded
+                .program(&name)
+                .ok_or_else(|| missing(&name))?
+                .attach_to_cpu(&resolver, "syscalls", event, cpu)
+        })
+        .collect::<io::Result<Vec<_>>>()?;
     let path = CString::new("/dev/null").unwrap();
     let sink = File::options().write(true).open("/dev/null")?;
     let payload = [0x5au8; 128];
@@ -242,7 +248,7 @@ fn main() -> io::Result<()> {
         .fold(0, u64::wrapping_add);
     let requested = calls * producer_cpus.len() as u64;
     println!(
-        "mode=mold shape={mode} attachment=global_gated_v3 producers={} calls_per_producer={calls} requested={requested} received={received} dropped={gaps} unaccounted={} loss_pct={:.4} producer_seconds={producer_seconds:.6} requested_per_second={:.0} consumer_cpu_ms={:.3} lanes={lanes} capacity={capacity} map_bytes={} max_backlog={max_backlog} worst_lane={} worst_worker={} worst_involuntary={} worst_wall_ms={:.3} worst_cpu_ms={:.3} max_checkpoint_offcpu_ms={:.3} pause_lane={} pause_worker={} consumer_mark_interval={CONSUMER_MARK_INTERVAL} checksum={checksum}",
+        "mode=mold shape={mode} attachment=per_cpu_gated_v4 producers={} calls_per_producer={calls} requested={requested} received={received} dropped={gaps} unaccounted={} loss_pct={:.4} producer_seconds={producer_seconds:.6} requested_per_second={:.0} consumer_cpu_ms={:.3} lanes={lanes} capacity={capacity} map_bytes={} max_backlog={max_backlog} worst_lane={} worst_worker={} worst_involuntary={} worst_wall_ms={:.3} worst_cpu_ms={:.3} max_checkpoint_offcpu_ms={:.3} pause_lane={} pause_worker={} consumer_mark_interval={CONSUMER_MARK_INTERVAL} checksum={checksum}",
         producer_cpus.len(),
         requested.abs_diff(received + gaps),
         gaps as f64 * 100.0 / requested.max(1) as f64,
