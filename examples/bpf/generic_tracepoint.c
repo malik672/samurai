@@ -19,12 +19,21 @@ struct capture_operation {
     u32 reserved;
 };
 
+struct capture_scratch {
+    u64 words[MOLD_WORDS];
+};
+
 __attribute__((section("maps"), used))
 struct map_def capture_config = {2, sizeof(u32), sizeof(u64), 1, 0};
 
 __attribute__((section("maps"), used))
 struct map_def capture_operations = {
     2, sizeof(u32), sizeof(struct capture_operation), CAPTURE_OPERATIONS, 0
+};
+
+__attribute__((section("maps"), used))
+struct map_def capture_scratch = {
+    6, sizeof(u32), sizeof(struct capture_scratch), 1, 0
 };
 
 static __attribute__((always_inline)) u64
@@ -40,11 +49,12 @@ int record_generic_tracepoint(void *ctx) {
     u32 zero = 0;
     u64 *operation_count = map_lookup_elem(&capture_config, &zero);
     if (!operation_count || *operation_count > CAPTURE_OPERATIONS) return 0;
+    struct capture_scratch *scratch = map_lookup_elem(&capture_scratch, &zero);
+    if (!scratch) return 0;
 
     u32 cpu = (u32)get_smp_processor_id();
-    u64 words[MOLD_WORDS] = {};
-    words[0] = ktime_get_ns();
-    words[1] = cpu;
+    scratch->words[0] = ktime_get_ns();
+    scratch->words[1] = cpu;
 
     for (u32 index = 0; index < CAPTURE_OPERATIONS; index++) {
         if (index >= *operation_count) break;
@@ -59,10 +69,10 @@ int record_generic_tracepoint(void *ctx) {
             return 0;
         if (operation->flags & CAPTURE_SIGNED)
             value = sign_extend(value, size);
-        words[operation->destination_word] = value;
+        scratch->words[operation->destination_word] = value;
     }
 
-    mold_publish(cpu, words);
+    mold_publish(cpu, scratch->words);
     return 0;
 }
 
