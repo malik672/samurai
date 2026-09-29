@@ -92,15 +92,14 @@ fn main() -> io::Result<()> {
     };
     let pointer_offset = offset(pointer_field)?;
     let length_offset = length_field.map(offset).transpose()?.unwrap_or(0);
-    let loaded = ObjectLoader::from_file(&args[1])?.load()?;
+    let mut loader = ObjectLoader::from_file(&args[1])?;
+    loader.set_program_copies(program_name, producer_cpus.len())?;
+    let loaded = loader.load()?;
     let slots = loaded.map("slots").ok_or_else(|| missing("slots"))?;
     let frontiers = loaded
         .map("frontiers")
         .ok_or_else(|| missing("frontiers"))?;
     let config = loaded.map("config").ok_or_else(|| missing("config"))?;
-    let program = loaded
-        .program(program_name)
-        .ok_or_else(|| missing(program_name))?;
     let mut config_value = [0u8; 16];
     config_value[..4].copy_from_slice(&std::process::id().to_ne_bytes());
     config_value[4..8].copy_from_slice(&pointer_offset.to_ne_bytes());
@@ -141,7 +140,13 @@ fn main() -> io::Result<()> {
         Barrier::new(producer_cpus.len() + consumer_cpus.len().min(producer_cpus.len()) + 1);
     let _attachments = producer_cpus
         .iter()
-        .map(|&cpu| program.attach_to_cpu(&resolver, "syscalls", event, cpu))
+        .enumerate()
+        .map(|(index, &cpu)| {
+            loaded
+                .program_copy(program_name, index)
+                .ok_or_else(|| missing(program_name))?
+                .attach_to_cpu(&resolver, "syscalls", event, cpu)
+        })
         .collect::<io::Result<Vec<_>>>()?;
     let path = CString::new("/dev/null").unwrap();
     let sink = File::options().write(true).open("/dev/null")?;

@@ -21,6 +21,7 @@ use super::{
 
 pub struct ObjectLoader {
     object: Object,
+    program_copies: FxHashMap<String, usize>,
 }
 
 pub struct LoadedObject {
@@ -29,6 +30,7 @@ pub struct LoadedObject {
     per_cpu_array_maps: FxHashMap<String, PerCpuArrayMap>,
     lru_per_cpu_hash_maps: FxHashMap<String, LruPerCpuHashMap>,
     ring_buffer_maps: FxHashMap<String, RingBufferMap>,
+    extra_programs: FxHashMap<String, Vec<TracePoint>>,
 }
 
 impl ObjectLoader {
@@ -87,7 +89,10 @@ impl ObjectLoader {
                 )));
             }
         }
-        Ok(Self { object })
+        Ok(Self {
+            object,
+            program_copies: FxHashMap::default(),
+        })
     }
 
     pub fn from_file(path: impl AsRef<Path>) -> io::Result<Self> {
@@ -100,6 +105,19 @@ impl ObjectLoader {
 
     pub fn map_names(&self) -> impl Iterator<Item = &str> {
         self.object.maps.keys().map(String::as_str)
+    }
+
+    /// Request multiple independently loaded instances of one program.
+    /// All instances are relocated against the same maps.
+    pub fn set_program_copies(&mut self, name: &str, copies: usize) -> io::Result<()> {
+        if copies == 0 || !self.object.programs.contains_key(name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "program copies require a known program and a non-zero count",
+            ));
+        }
+        self.program_copies.insert(name.to_owned(), copies);
+        Ok(())
     }
 
     /// Create maps, relocate and load all programs, then drop parsed data.
@@ -167,6 +185,16 @@ impl ObjectLoader {
             .relocate_calls(&sections)
             .map_err(invalid_data)?;
 
+        let mut extra_programs = FxHashMap::default();
+        for (name, copies) in &self.program_copies {
+            let program = &self.object.programs[name];
+            let function = &self.object.functions[&program.function_key()];
+            let instances = (1..*copies)
+                .map(|_| TracePoint::load(program, function))
+                .collect::<io::Result<Vec<_>>>()?;
+            extra_programs.insert(name.clone(), instances);
+        }
+
         let programs = load_programs(self.object, TracePoint::load)?;
         Ok(LoadedObject {
             programs,
@@ -174,6 +202,7 @@ impl ObjectLoader {
             per_cpu_array_maps,
             lru_per_cpu_hash_maps,
             ring_buffer_maps,
+            extra_programs,
         })
     }
 }
@@ -217,6 +246,14 @@ impl LoadedObject {
 
     pub fn program(&self, name: &str) -> Option<&TracePoint> {
         self.programs.get(name)
+    }
+
+    pub fn program_copy(&self, name: &str, index: usize) -> Option<&TracePoint> {
+        if index == 0 {
+            self.program(name)
+        } else {
+            self.extra_programs.get(name)?.get(index - 1)
+        }
     }
 }
 
