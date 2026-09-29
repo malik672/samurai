@@ -44,6 +44,37 @@ sign_extend(u64 value, unsigned short size) {
     return value;
 }
 
+#define DEFINE_READ(size)                                                       \
+    static __attribute__((noinline)) int read_##size(                           \
+        void *ctx, u32 source_offset, u64 *value) {                             \
+        return probe_read_kernel(value, size,                                   \
+                                 (const char *)ctx + source_offset);             \
+    }
+DEFINE_READ(1)
+DEFINE_READ(2)
+DEFINE_READ(3)
+DEFINE_READ(4)
+DEFINE_READ(5)
+DEFINE_READ(6)
+DEFINE_READ(7)
+DEFINE_READ(8)
+#undef DEFINE_READ
+
+static __attribute__((always_inline)) int
+read_fixed(void *ctx, u32 source_offset, unsigned short size, u64 *value) {
+    switch (size) {
+    case 1: return read_1(ctx, source_offset, value);
+    case 2: return read_2(ctx, source_offset, value);
+    case 3: return read_3(ctx, source_offset, value);
+    case 4: return read_4(ctx, source_offset, value);
+    case 5: return read_5(ctx, source_offset, value);
+    case 6: return read_6(ctx, source_offset, value);
+    case 7: return read_7(ctx, source_offset, value);
+    case 8: return read_8(ctx, source_offset, value);
+    default: return -1;
+    }
+}
+
 static __attribute__((always_inline)) int
 capture_one(void *ctx, u32 index, u64 *captured) {
     struct capture_operation *operation =
@@ -51,10 +82,7 @@ capture_one(void *ctx, u32 index, u64 *captured) {
     if (!operation) return 0;
     u64 value = 0;
     unsigned short size = operation->size;
-    /* A fixed byte field may end with a partial word of any size from 1..=8. */
-    if (size == 0 || size > sizeof(value)) return 0;
-    if (probe_read_kernel(&value, size,
-                          (const char *)ctx + operation->source_offset) < 0)
+    if (read_fixed(ctx, operation->source_offset, size, &value) < 0)
         return 0;
     if (operation->flags & CAPTURE_SIGNED)
         value = sign_extend(value, size);
