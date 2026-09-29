@@ -89,10 +89,7 @@ pub(crate) fn load_program_with_type(
     let insn_cnt = u32::try_from(insns.len())
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
 
-    // The kernel verifier can write its explanation here.
-    let mut log = vec![0u8; 64 * 1024];
-
-    let attr = BpfProgLoadAttr {
+    let mut attr = BpfProgLoadAttr {
         prog_type,
         kern_version,
 
@@ -104,45 +101,55 @@ pub(crate) fn load_program_with_type(
         // Address of "GPL\0" in OUR process.
         license: license.as_ptr() as u64,
 
-        log_level: 1,
-        log_size: log.len() as u32,
-
-        // Writable userspace buffer where the verifier can put text.
-        log_buf: log.as_mut_ptr() as u64,
-
         ..Default::default()
     };
 
-    let ret = unsafe {
-        libc::syscall(
-            libc::SYS_bpf,
-            BPF_PROG_LOAD,
-            &attr as *const BpfProgLoadAttr,
-            std::mem::size_of::<BpfProgLoadAttr>(),
-        )
-    };
+    // A success log can exceed a fixed userspace buffer and make an otherwise
+    // valid BPF_PROG_LOAD fail with ENOSPC. Load quietly first, as libbpf does.
+    let ret = prog_load(&attr);
 
     if ret < 0 {
-        let error = io::Error::last_os_error();
+        let original_error = io::Error::last_os_error();
+        let mut log = vec![0u8; 1024 * 1024];
+        attr.log_level = 1;
+        attr.log_size = log.len() as u32;
+        attr.log_buf = log.as_mut_ptr() as u64;
+        let diagnostic_ret = prog_load(&attr);
+        if diagnostic_ret >= 0 {
+            return Ok(unsafe { OwnedFd::from_raw_fd(diagnostic_ret as i32) });
+        }
+        let diagnostic_error = io::Error::last_os_error();
 
         let end = log.iter().position(|&byte| byte == 0).unwrap_or(log.len());
-
         let verifier_log = String::from_utf8_lossy(&log[..end]);
 
-        eprintln!("BPF_PROG_LOAD failed: {error}");
+        eprintln!("BPF_PROG_LOAD failed: {original_error}");
 
         if !verifier_log.is_empty() {
             eprintln!("--- verifier log ---");
             eprintln!("{verifier_log}");
         }
-
-        return Err(error);
+        if diagnostic_error.raw_os_error() == Some(libc::ENOSPC) {
+            eprintln!("verifier diagnostic log exceeded {} bytes", log.len());
+        }
+        return Err(original_error);
     }
 
     // Successful BPF_PROG_LOAD returns a file descriptor.
     let fd = ret as i32;
 
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn prog_load(attr: &BpfProgLoadAttr) -> libc::c_long {
+    unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            BPF_PROG_LOAD,
+            attr as *const BpfProgLoadAttr,
+            std::mem::size_of::<BpfProgLoadAttr>(),
+        )
+    }
 }
 
 /// The caller must ensure this is a map with a four-byte key and eight-byte value.
