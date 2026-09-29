@@ -44,48 +44,8 @@ sign_extend(u64 value, unsigned short size) {
     return value;
 }
 
-static __attribute__((noinline)) int
-store_word(struct capture_scratch *scratch, unsigned short destination, u64 value) {
-    switch (destination) {
-    case 2: scratch->words[2] = value; break;
-    case 3: scratch->words[3] = value; break;
-    case 4: scratch->words[4] = value; break;
-    case 5: scratch->words[5] = value; break;
-    case 6: scratch->words[6] = value; break;
-    case 7: scratch->words[7] = value; break;
-    case 8: scratch->words[8] = value; break;
-    case 9: scratch->words[9] = value; break;
-    case 10: scratch->words[10] = value; break;
-    case 11: scratch->words[11] = value; break;
-    case 12: scratch->words[12] = value; break;
-    case 13: scratch->words[13] = value; break;
-    case 14: scratch->words[14] = value; break;
-    case 15: scratch->words[15] = value; break;
-    case 16: scratch->words[16] = value; break;
-    case 17: scratch->words[17] = value; break;
-    case 18: scratch->words[18] = value; break;
-    case 19: scratch->words[19] = value; break;
-    case 20: scratch->words[20] = value; break;
-    case 21: scratch->words[21] = value; break;
-    case 22: scratch->words[22] = value; break;
-    case 23: scratch->words[23] = value; break;
-    case 24: scratch->words[24] = value; break;
-    case 25: scratch->words[25] = value; break;
-    case 26: scratch->words[26] = value; break;
-    case 27: scratch->words[27] = value; break;
-    case 28: scratch->words[28] = value; break;
-    case 29: scratch->words[29] = value; break;
-    case 30: scratch->words[30] = value; break;
-    case 31: scratch->words[31] = value; break;
-    case 32: scratch->words[32] = value; break;
-    case 33: scratch->words[33] = value; break;
-    default: return 0;
-    }
-    return 1;
-}
-
 static __attribute__((always_inline)) int
-capture_one(void *ctx, struct capture_scratch *scratch, u32 index) {
+capture_one(void *ctx, u32 index, u64 *captured) {
     struct capture_operation *operation =
         map_lookup_elem(&capture_operations, &index);
     if (!operation) return 0;
@@ -97,8 +57,48 @@ capture_one(void *ctx, struct capture_scratch *scratch, u32 index) {
         return 0;
     if (operation->flags & CAPTURE_SIGNED)
         value = sign_extend(value, size);
-    return store_word(scratch, operation->destination_word, value);
+    *captured = value;
+    return 1;
 }
+
+#define DEFINE_STORE(word)                                                     \
+    static __attribute__((noinline)) void store_word_##word(                   \
+        struct capture_scratch *scratch, u64 value) {                          \
+        scratch->words[word] = value;                                           \
+    }
+DEFINE_STORE(2)
+DEFINE_STORE(3)
+DEFINE_STORE(4)
+DEFINE_STORE(5)
+DEFINE_STORE(6)
+DEFINE_STORE(7)
+DEFINE_STORE(8)
+DEFINE_STORE(9)
+DEFINE_STORE(10)
+DEFINE_STORE(11)
+DEFINE_STORE(12)
+DEFINE_STORE(13)
+DEFINE_STORE(14)
+DEFINE_STORE(15)
+DEFINE_STORE(16)
+DEFINE_STORE(17)
+DEFINE_STORE(18)
+DEFINE_STORE(19)
+DEFINE_STORE(20)
+DEFINE_STORE(21)
+DEFINE_STORE(22)
+DEFINE_STORE(23)
+DEFINE_STORE(24)
+DEFINE_STORE(25)
+DEFINE_STORE(26)
+DEFINE_STORE(27)
+DEFINE_STORE(28)
+DEFINE_STORE(29)
+DEFINE_STORE(30)
+DEFINE_STORE(31)
+DEFINE_STORE(32)
+DEFINE_STORE(33)
+#undef DEFINE_STORE
 
 __attribute__((section("tracepoint/samurai/generic"), used))
 int record_generic_tracepoint(void *ctx) {
@@ -113,41 +113,44 @@ int record_generic_tracepoint(void *ctx) {
     scratch->words[0] = ktime_get_ns();
     scratch->words[1] = cpu;
 
-#define CAPTURE_INDEX(index)                                                   \
-    if (operation_count > (index) && !capture_one(ctx, scratch, (index)))     \
-        return 0
-    CAPTURE_INDEX(0);
-    CAPTURE_INDEX(1);
-    CAPTURE_INDEX(2);
-    CAPTURE_INDEX(3);
-    CAPTURE_INDEX(4);
-    CAPTURE_INDEX(5);
-    CAPTURE_INDEX(6);
-    CAPTURE_INDEX(7);
-    CAPTURE_INDEX(8);
-    CAPTURE_INDEX(9);
-    CAPTURE_INDEX(10);
-    CAPTURE_INDEX(11);
-    CAPTURE_INDEX(12);
-    CAPTURE_INDEX(13);
-    CAPTURE_INDEX(14);
-    CAPTURE_INDEX(15);
-    CAPTURE_INDEX(16);
-    CAPTURE_INDEX(17);
-    CAPTURE_INDEX(18);
-    CAPTURE_INDEX(19);
-    CAPTURE_INDEX(20);
-    CAPTURE_INDEX(21);
-    CAPTURE_INDEX(22);
-    CAPTURE_INDEX(23);
-    CAPTURE_INDEX(24);
-    CAPTURE_INDEX(25);
-    CAPTURE_INDEX(26);
-    CAPTURE_INDEX(27);
-    CAPTURE_INDEX(28);
-    CAPTURE_INDEX(29);
-    CAPTURE_INDEX(30);
-    CAPTURE_INDEX(31);
+#define CAPTURE_INDEX(index, word)                                             \
+    if (operation_count > (index)) {                                           \
+        u64 captured;                                                          \
+        if (!capture_one(ctx, (index), &captured)) return 0;                   \
+        store_word_##word(scratch, captured);                                  \
+    }
+    CAPTURE_INDEX(0, 2);
+    CAPTURE_INDEX(1, 3);
+    CAPTURE_INDEX(2, 4);
+    CAPTURE_INDEX(3, 5);
+    CAPTURE_INDEX(4, 6);
+    CAPTURE_INDEX(5, 7);
+    CAPTURE_INDEX(6, 8);
+    CAPTURE_INDEX(7, 9);
+    CAPTURE_INDEX(8, 10);
+    CAPTURE_INDEX(9, 11);
+    CAPTURE_INDEX(10, 12);
+    CAPTURE_INDEX(11, 13);
+    CAPTURE_INDEX(12, 14);
+    CAPTURE_INDEX(13, 15);
+    CAPTURE_INDEX(14, 16);
+    CAPTURE_INDEX(15, 17);
+    CAPTURE_INDEX(16, 18);
+    CAPTURE_INDEX(17, 19);
+    CAPTURE_INDEX(18, 20);
+    CAPTURE_INDEX(19, 21);
+    CAPTURE_INDEX(20, 22);
+    CAPTURE_INDEX(21, 23);
+    CAPTURE_INDEX(22, 24);
+    CAPTURE_INDEX(23, 25);
+    CAPTURE_INDEX(24, 26);
+    CAPTURE_INDEX(25, 27);
+    CAPTURE_INDEX(26, 28);
+    CAPTURE_INDEX(27, 29);
+    CAPTURE_INDEX(28, 30);
+    CAPTURE_INDEX(29, 31);
+    CAPTURE_INDEX(30, 32);
+    CAPTURE_INDEX(31, 33);
 #undef CAPTURE_INDEX
 
     mold_publish(cpu, scratch->words);
