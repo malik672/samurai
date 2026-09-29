@@ -1,0 +1,18 @@
+Dynamic string transport CPU profiling
+
+- Investigate Mold's consumer CPU cost for 128-byte UserString capture.
+- Current 10-pair result: +19.22% producer rate and +11.40% end-to-end
+  delivered rate versus Aya, but +28.04% task clock and +179.17% context
+  switches, with zero loss.
+- The 4,000,000-record perf run completed with zero loss in 2.940657 seconds.
+  Its four consume_lane workers used 11.334759 CPU-seconds in total, about
+  3.85 cores, and each represented roughly 12.8% of task-clock samples.
+- Collect a flat profile with:
+  sudo perf report -i target/mold-string.data --stdio --no-children \
+    --sort pid,symbol
+- Inspect the loop with:
+  sudo perf annotate -i target/mold-string.data \
+    'dynamic_controlled::consume_lane'
+- Test an adaptive empty-lane backoff that spins briefly while active and
+  backs off only after repeated empty polls. Measure throughput, task clock,
+  context switches, latency, backlog, and loss before keeping it.
