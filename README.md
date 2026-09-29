@@ -212,6 +212,24 @@ Each plan fixes the source offset, byte width, signedness, destination Mold
 word, record width, and required tracepoint-context span. Dynamic data and
 pointers remain policy inputs rather than being guessed from kernel metadata.
 
+The prebuilt generic reader executes that plan without a runtime compiler. For
+example, record three fixed `sched_switch` fields from the current kernel:
+
+```sh
+clang -target bpfel -mcpu=v3 -O2 -I examples/bpf \
+  -c examples/bpf/generic_tracepoint.c \
+  -o target/generic-tracepoint.bpf.o
+cargo build --release --example generic_tracepoint
+sudo ./target/release/examples/generic_tracepoint \
+  target/generic-tracepoint.bpf.o \
+  sched sched_switch prev_pid,next_pid,prev_state 5
+```
+
+At startup, userspace lowers selected fields into at most 32 bounded copy
+operations and installs them in BPF array maps. The BPF program accepts only
+1-, 2-, 4-, and 8-byte reads, uses a fixed 34-word Mold ABI, and never
+interprets an unannotated pointer.
+
 ### Reproducible transport comparison
 
 `benches/transport_comparison.py` runs alternating paired trials against Aya,

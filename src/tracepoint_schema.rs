@@ -3,6 +3,8 @@ use std::{collections::HashSet, fmt::Write as _, io};
 
 const MOLD_METADATA_WORDS: usize = 2;
 const BPF_STACK_RECORD_BUDGET: usize = 384;
+pub const GENERIC_CAPTURE_WORDS: usize = 34;
+pub const GENERIC_CAPTURE_OPERATIONS: usize = GENERIC_CAPTURE_WORDS - MOLD_METADATA_WORDS;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TracepointField {
@@ -42,6 +44,26 @@ pub struct CaptureField {
     pub words: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaptureOperation {
+    pub source_offset: u32,
+    pub size: u16,
+    pub destination_word: u16,
+    pub signed: bool,
+}
+
+impl CaptureOperation {
+    /// Stable 16-byte ABI consumed by `examples/bpf/generic_tracepoint.c`.
+    pub fn to_bytes(self) -> [u8; 16] {
+        let mut bytes = [0; 16];
+        bytes[..4].copy_from_slice(&self.source_offset.to_ne_bytes());
+        bytes[4..6].copy_from_slice(&self.size.to_ne_bytes());
+        bytes[6..8].copy_from_slice(&self.destination_word.to_ne_bytes());
+        bytes[8..12].copy_from_slice(&u32::from(self.signed).to_ne_bytes());
+        bytes
+    }
+}
+
 impl CapturePlan {
     /// Discover and validate a fixed-field plan from the running kernel.
     pub fn discover(
@@ -52,6 +74,36 @@ impl CapturePlan {
     ) -> io::Result<Self> {
         let format = resolver.format(category, event)?;
         capture_plan(category, event, &format, selected)
+    }
+
+    /// Lower fields into bounded operations understood by the generic BPF reader.
+    pub fn operations(&self) -> io::Result<Vec<CaptureOperation>> {
+        let mut operations = Vec::new();
+        for field in &self.fields {
+            let mut copied = 0usize;
+            while copied < field.size {
+                let size = (field.size - copied).min(size_of::<u64>());
+                operations.push(CaptureOperation {
+                    source_offset: u32::try_from(field.source_offset + copied).map_err(|_| {
+                        io::Error::new(io::ErrorKind::Unsupported, "tracepoint offset exceeds u32")
+                    })?,
+                    size: u16::try_from(size).unwrap(),
+                    destination_word: u16::try_from(field.destination_word + copied / 8).unwrap(),
+                    signed: field.signed && field.words == 1,
+                });
+                copied += size;
+            }
+        }
+        if operations.len() > GENERIC_CAPTURE_OPERATIONS {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "capture requires {} operations; generic reader supports {GENERIC_CAPTURE_OPERATIONS}",
+                    operations.len()
+                ),
+            ));
+        }
+        Ok(operations)
     }
 }
 
@@ -539,6 +591,29 @@ format:
                     signed: true,
                     destination_word: 4,
                     words: 1,
+                },
+            ]
+        );
+        assert_eq!(
+            plan.operations().unwrap(),
+            [
+                CaptureOperation {
+                    source_offset: 24,
+                    size: 4,
+                    destination_word: 2,
+                    signed: true,
+                },
+                CaptureOperation {
+                    source_offset: 32,
+                    size: 8,
+                    destination_word: 3,
+                    signed: true,
+                },
+                CaptureOperation {
+                    source_offset: 56,
+                    size: 4,
+                    destination_word: 4,
+                    signed: true,
                 },
             ]
         );
