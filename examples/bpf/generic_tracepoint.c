@@ -44,7 +44,7 @@ sign_extend(u64 value, unsigned short size) {
     return value;
 }
 
-static __attribute__((always_inline)) int
+static __attribute__((noinline)) int
 store_word(struct capture_scratch *scratch, unsigned short destination, u64 value) {
     switch (destination) {
     case 2: scratch->words[2] = value; break;
@@ -84,11 +84,28 @@ store_word(struct capture_scratch *scratch, unsigned short destination, u64 valu
     return 1;
 }
 
+static __attribute__((always_inline)) int
+capture_one(void *ctx, struct capture_scratch *scratch, u32 index) {
+    struct capture_operation *operation =
+        map_lookup_elem(&capture_operations, &index);
+    if (!operation) return 0;
+    u64 value = 0;
+    unsigned short size = operation->size;
+    if (size != 1 && size != 2 && size != 4 && size != 8) return 0;
+    if (probe_read_kernel(&value, size,
+                          (const char *)ctx + operation->source_offset) < 0)
+        return 0;
+    if (operation->flags & CAPTURE_SIGNED)
+        value = sign_extend(value, size);
+    return store_word(scratch, operation->destination_word, value);
+}
+
 __attribute__((section("tracepoint/samurai/generic"), used))
 int record_generic_tracepoint(void *ctx) {
     u32 zero = 0;
-    u64 *operation_count = map_lookup_elem(&capture_config, &zero);
-    if (!operation_count || *operation_count > CAPTURE_OPERATIONS) return 0;
+    u64 *configured_count = map_lookup_elem(&capture_config, &zero);
+    if (!configured_count || *configured_count > CAPTURE_OPERATIONS) return 0;
+    u64 operation_count = *configured_count;
     struct capture_scratch *scratch = map_lookup_elem(&capture_scratch, &zero);
     if (!scratch) return 0;
 
@@ -96,21 +113,42 @@ int record_generic_tracepoint(void *ctx) {
     scratch->words[0] = ktime_get_ns();
     scratch->words[1] = cpu;
 
-    for (u32 index = 0; index < CAPTURE_OPERATIONS; index++) {
-        if (index >= *operation_count) break;
-        struct capture_operation *operation =
-            map_lookup_elem(&capture_operations, &index);
-        if (!operation) return 0;
-        u64 value = 0;
-        unsigned short size = operation->size;
-        if (size != 1 && size != 2 && size != 4 && size != 8) return 0;
-        if (probe_read_kernel(&value, size,
-                              (const char *)ctx + operation->source_offset) < 0)
-            return 0;
-        if (operation->flags & CAPTURE_SIGNED)
-            value = sign_extend(value, size);
-        if (!store_word(scratch, operation->destination_word, value)) return 0;
-    }
+#define CAPTURE_INDEX(index)                                                   \
+    if (operation_count > (index) && !capture_one(ctx, scratch, (index)))     \
+        return 0
+    CAPTURE_INDEX(0);
+    CAPTURE_INDEX(1);
+    CAPTURE_INDEX(2);
+    CAPTURE_INDEX(3);
+    CAPTURE_INDEX(4);
+    CAPTURE_INDEX(5);
+    CAPTURE_INDEX(6);
+    CAPTURE_INDEX(7);
+    CAPTURE_INDEX(8);
+    CAPTURE_INDEX(9);
+    CAPTURE_INDEX(10);
+    CAPTURE_INDEX(11);
+    CAPTURE_INDEX(12);
+    CAPTURE_INDEX(13);
+    CAPTURE_INDEX(14);
+    CAPTURE_INDEX(15);
+    CAPTURE_INDEX(16);
+    CAPTURE_INDEX(17);
+    CAPTURE_INDEX(18);
+    CAPTURE_INDEX(19);
+    CAPTURE_INDEX(20);
+    CAPTURE_INDEX(21);
+    CAPTURE_INDEX(22);
+    CAPTURE_INDEX(23);
+    CAPTURE_INDEX(24);
+    CAPTURE_INDEX(25);
+    CAPTURE_INDEX(26);
+    CAPTURE_INDEX(27);
+    CAPTURE_INDEX(28);
+    CAPTURE_INDEX(29);
+    CAPTURE_INDEX(30);
+    CAPTURE_INDEX(31);
+#undef CAPTURE_INDEX
 
     mold_publish(cpu, scratch->words);
     return 0;
