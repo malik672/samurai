@@ -92,19 +92,20 @@ fn main() -> io::Result<()> {
     };
     let pointer_offset = offset(pointer_field)?;
     let length_offset = length_field.map(offset).transpose()?.unwrap_or(0);
-    let mut loader = ObjectLoader::from_file(&args[1])?;
-    loader.set_program_copies(program_name, producer_cpus.len())?;
-    let loaded = loader.load()?;
+    let loaded = ObjectLoader::from_file(&args[1])?.load()?;
     let slots = loaded.map("slots").ok_or_else(|| missing("slots"))?;
     let frontiers = loaded
         .map("frontiers")
         .ok_or_else(|| missing("frontiers"))?;
     let config = loaded.map("config").ok_or_else(|| missing("config"))?;
-    let mut config_value = [0u8; 16];
+    let program = loaded
+        .program(program_name)
+        .ok_or_else(|| missing(program_name))?;
+    let mut config_value = [0u8; 20];
     config_value[..4].copy_from_slice(&std::process::id().to_ne_bytes());
     config_value[4..8].copy_from_slice(&pointer_offset.to_ne_bytes());
     config_value[8..12].copy_from_slice(&length_offset.to_ne_bytes());
-    config_value[12..].copy_from_slice(&mode_id.to_ne_bytes());
+    config_value[12..16].copy_from_slice(&mode_id.to_ne_bytes());
     config.write(0, &config_value)?;
     let slots = slots.mmap()?;
     let frontiers = frontiers.mmap()?;
@@ -138,16 +139,7 @@ fn main() -> io::Result<()> {
     let stop = AtomicBool::new(false);
     let start =
         Barrier::new(producer_cpus.len() + consumer_cpus.len().min(producer_cpus.len()) + 1);
-    let _attachments = producer_cpus
-        .iter()
-        .enumerate()
-        .map(|(index, &cpu)| {
-            loaded
-                .program_copy(program_name, index)
-                .ok_or_else(|| missing(program_name))?
-                .attach_to_cpu(&resolver, "syscalls", event, cpu)
-        })
-        .collect::<io::Result<Vec<_>>>()?;
+    let _attachment = program.attach_to_cpu(&resolver, "syscalls", event, producer_cpus[0])?;
     let path = CString::new("/dev/null").unwrap();
     let sink = File::options().write(true).open("/dev/null")?;
     let payload = [0x5au8; 128];
@@ -210,6 +202,8 @@ fn main() -> io::Result<()> {
                 })
             })
             .collect();
+        config_value[16..20].copy_from_slice(&1u32.to_ne_bytes());
+        config.write(0, &config_value)?;
         let wall = Instant::now();
         start.wait();
         for producer in producers {
@@ -218,6 +212,8 @@ fn main() -> io::Result<()> {
                 .map_err(|_| io::Error::other("producer panicked"))??;
         }
         producer_seconds = wall.elapsed().as_secs_f64();
+        config_value[16..20].copy_from_slice(&0u32.to_ne_bytes());
+        config.write(0, &config_value)?;
         stop.store(true, Ordering::Release);
         for consumer in consumers {
             results.push(

@@ -9,7 +9,7 @@
 #define MOLD_WORDS 19
 #include "mold.h"
 
-struct config { u32 pid, pointer_offset, length_offset, mode; };
+struct config { u32 pid, pointer_offset, length_offset, mode, enabled; };
 __attribute__((section("maps"), used))
 struct map_def config = {2, sizeof(u32), sizeof(struct config), 1, 0};
 
@@ -24,7 +24,8 @@ static __attribute__((always_inline)) int emit(void *ctx, u32 expected_mode) {
     u32 zero = 0;
     struct config *cfg = map_lookup_elem(&config, &zero);
     u64 pid_tgid = get_current_pid_tgid();
-    if (!cfg || cfg->pid != (u32)(pid_tgid >> 32) || cfg->mode != expected_mode)
+    if (!cfg || !cfg->enabled || cfg->pid != (u32)(pid_tgid >> 32) ||
+        cfg->mode != expected_mode)
         return 0;
     u64 pointer = 0, length = 128;
     if (probe_read_kernel(&pointer, 8, (char *)ctx + cfg->pointer_offset) < 0)
