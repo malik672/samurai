@@ -205,10 +205,9 @@ compiler metadata under `target/dynamic-transport-comparison/`. The scalar
 baseline remains `benches/transport_comparison.py`, so its established fixture
 and historical results are unchanged.
 
-The Aya eBPF build requires `bpf-linker` to use the same LLVM major version as
-the installed nightly Rust toolchain. The harness stops during its build phase
-if those versions differ; update one side before collecting results rather than
-reusing a stale BPF object.
+Both benchmark BPF objects are compiled with the same clang invocation. Aya is
+used for loading and consuming its RingBuf object, so the comparison does not
+depend on a matching Rust nightly and `bpf-linker` LLVM version.
 
 The privileged helper compatibility test adapts Aya's normal, truncation,
 empty-string, and invalid-pointer cases and verifies them through Mold:

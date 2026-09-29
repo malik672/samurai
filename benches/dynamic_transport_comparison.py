@@ -8,8 +8,8 @@ def build(root, aya, user):
     uid, gid, home, env = user
     subprocess.run([home/".cargo/bin/cargo", "build", "--release", "--example", "dynamic_controlled"], cwd=root, env=env, user=uid, group=gid, check=True)
     subprocess.run(["clang", "-target", "bpfel", "-mcpu=v3", "-O2", "-Wall", "-Wextra", "-Werror", "-I", "examples/bpf", "-DCAPACITY=8192", "-c", "examples/bpf/dynamic_controlled.c", "-o", "target/dynamic-controlled.bpf.o"], cwd=root, env=env, user=uid, group=gid, check=True)
+    subprocess.run(["clang", "-target", "bpfel", "-mcpu=v3", "-O2", "-Wall", "-Wextra", "-Werror", "-c", "benches/dynamic_aya.c", "-o", "target/dynamic-aya.bpf.o"], cwd=root, env=env, user=uid, group=gid, check=True)
     subprocess.run([home/".cargo/bin/cargo", "build", "--release", "-p", "aya", "--example", "dynamic_controlled_bench"], cwd=aya, env=env, user=uid, group=gid, check=True)
-    subprocess.run([home/".cargo/bin/cargo", "+nightly", "build", "-Zbuild-std=core", "--release", "-p", "integration-ebpf", "--bin", "mold-bench", "--target", "bpfel-unknown-none"], cwd=aya, env=env, user=uid, group=gid, check=True)
 
 def main():
     parser=argparse.ArgumentParser()
@@ -21,7 +21,7 @@ def main():
     shapes=("string","bytes") if args.shape=="both" else (args.shape,); all_rows=[]
     for shape in shapes:
         commands={
-          "aya":[aya/"target/release/examples/dynamic_controlled_bench",shape,aya/"target/bpfel-unknown-none/release/mold-bench",str(args.calls),args.producer_cpus,args.consumer_cpus.split(",")[0]],
+          "aya":[aya/"target/release/examples/dynamic_controlled_bench",shape,root/"target/dynamic-aya.bpf.o",str(args.calls),args.producer_cpus,args.consumer_cpus.split(",")[0]],
           "mold":[root/"target/release/examples/dynamic_controlled",shape,root/"target/dynamic-controlled.bpf.o",str(args.calls),args.producer_cpus,args.consumer_cpus],
         }
         for _ in range(args.warmups):
