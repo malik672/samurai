@@ -1,7 +1,7 @@
 typedef unsigned int u32;
 typedef unsigned long long u64;
 struct map_def { u32 type, key_size, value_size, max_entries, map_flags; };
-struct config { u32 pid, pointer_offset, length_offset, mode; };
+struct config { u32 pid, pointer_offset, length_offset, mode, enabled; };
 struct event { u64 timestamp_ns; long result; unsigned char payload[128]; };
 
 __attribute__((section("maps"), used))
@@ -32,7 +32,7 @@ static __attribute__((always_inline)) int emit(void *ctx, u32 mode) {
     u32 zero = 0;
     struct config *cfg = map_lookup_elem(&DYNAMIC_CONFIG, &zero);
     u32 *cpu = map_lookup_elem(&DYNAMIC_CPU, &zero);
-    if (!cfg || !cpu || *cpu != get_smp_processor_id() ||
+    if (!cfg || !cfg->enabled || !cpu || *cpu != get_smp_processor_id() ||
         cfg->pid != (u32)(get_current_pid_tgid() >> 32) || cfg->mode != mode)
         return 0;
     u64 pointer = 0;

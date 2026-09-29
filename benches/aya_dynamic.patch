@@ -97,10 +97,10 @@ index 18413227..24ca1ea3 100644
      fd: BorrowedFd<'_>,
      request: PerfEventIoctlRequest<'_>,
 diff --git a/test/integration-common/src/lib.rs b/test/integration-common/src/lib.rs
-index 67d41e68..f1a9fd78 100644
+index 67d41e68..24ddba51 100644
 --- a/test/integration-common/src/lib.rs
 +++ b/test/integration-common/src/lib.rs
-@@ -148,6 +148,48 @@ pub mod ring_buf {
+@@ -148,6 +148,49 @@ pub mod ring_buf {
      unsafe impl aya::Pod for Registers {}
  }
  
@@ -140,6 +140,7 @@ index 67d41e68..f1a9fd78 100644
 +        pub pointer_offset: u32,
 +        pub length_offset: u32,
 +        pub mode: u32,
++        pub enabled: u32,
 +    }
 +
 +    #[cfg(feature = "user")]

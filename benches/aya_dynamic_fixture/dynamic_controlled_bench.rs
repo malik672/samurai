@@ -85,16 +85,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         .take_map("DYNAMIC_CONFIG")
         .ok_or("missing config")?
         .try_into()?;
-    config.set(
-        0,
-        &DynamicConfig {
-            pid: std::process::id(),
-            pointer_offset,
-            length_offset: 0,
-            mode,
-        },
-        0,
-    )?;
+    let mut config_value = DynamicConfig {
+        pid: std::process::id(),
+        pointer_offset,
+        length_offset: 0,
+        mode,
+        enabled: 0,
+    };
+    config.set(0, &config_value, 0)?;
     let stop = Arc::new(AtomicBool::new(false));
     let barrier = Arc::new(Barrier::new(cpus.len() + 2));
     let consumer = {
@@ -120,19 +118,23 @@ fn main() -> Result<(), Box<dyn Error>> {
             })
         })
         .collect::<Vec<_>>();
+    config_value.enabled = 1;
+    config.set(0, &config_value, 0)?;
     barrier.wait();
     let start = Instant::now();
     for producer in producers {
         producer.join().map_err(|_| "producer panic")?;
     }
     let producer_seconds = start.elapsed().as_secs_f64();
+    config_value.enabled = 0;
+    config.set(0, &config_value, 0)?;
     drop(bpfs);
     stop.store(true, Ordering::Release);
     let (received, cpu_ns, checksum) = consumer.join().map_err(|_| "consumer panic")??;
     let dropped: u64 = dropped.get(&0, 0)?.iter().sum();
     let requested = calls * producer_count as u64;
     println!(
-        "mode=aya shape={} attachment=cpu_filtered_v2 requested={} received={} dropped={} unaccounted={} loss_pct={:.4} producer_seconds={:.6} requested_per_second={:.0} consumer_cpu_ms={:.3} checksum={}",
+        "mode=aya shape={} attachment=cpu_filtered_gated_v3 requested={} received={} dropped={} unaccounted={} loss_pct={:.4} producer_seconds={:.6} requested_per_second={:.0} consumer_cpu_ms={:.3} checksum={}",
         if mode == 1 { "string" } else { "bytes" },
         requested,
         received,
