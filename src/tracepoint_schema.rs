@@ -1,6 +1,9 @@
 //! Generate fixed Mold schemas from Linux tracepoint format descriptions.
 use std::{collections::HashSet, fmt::Write as _, io};
 
+const MOLD_METADATA_WORDS: usize = 2;
+const BPF_STACK_RECORD_BUDGET: usize = 384;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TracepointField {
     pub declaration: String,
@@ -17,6 +20,81 @@ pub struct GeneratedTracepoint {
     pub bpf_c: String,
     pub words: usize,
     pub capacity: usize,
+}
+
+/// A startup-time plan for copying fixed tracepoint fields into Mold words.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapturePlan {
+    pub category: String,
+    pub event: String,
+    pub fields: Vec<CaptureField>,
+    pub words: usize,
+    pub context_size: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaptureField {
+    pub name: String,
+    pub source_offset: usize,
+    pub size: usize,
+    pub signed: bool,
+    pub destination_word: usize,
+    pub words: usize,
+}
+
+impl CapturePlan {
+    /// Discover and validate a fixed-field plan from the running kernel.
+    pub fn discover(
+        resolver: &crate::utils::tracepoint::TracepointResolver,
+        category: &str,
+        event: &str,
+        selected: Option<&[String]>,
+    ) -> io::Result<Self> {
+        let format = resolver.format(category, event)?;
+        capture_plan(category, event, &format, selected)
+    }
+}
+
+pub fn capture_plan(
+    category: &str,
+    event: &str,
+    format: &str,
+    selected: Option<&[String]>,
+) -> io::Result<CapturePlan> {
+    validate_identifier(category, "category")?;
+    validate_identifier(event, "event")?;
+    let fields = fixed_fields(format, selected)?;
+    let mut destination_word = MOLD_METADATA_WORDS;
+    let mut captures = Vec::with_capacity(fields.len());
+    let mut context_size = 0;
+    for field in fields {
+        let words = field_words(&field);
+        context_size = context_size.max(
+            field
+                .offset
+                .checked_add(field.size)
+                .ok_or_else(|| invalid("tracepoint field extent overflows usize"))?,
+        );
+        captures.push(CaptureField {
+            name: field.name,
+            source_offset: field.offset,
+            size: field.size,
+            signed: field.signed,
+            destination_word,
+            words,
+        });
+        destination_word = destination_word
+            .checked_add(words)
+            .ok_or_else(|| invalid("Mold word count overflows usize"))?;
+    }
+    validate_record_words(destination_word)?;
+    Ok(CapturePlan {
+        category: category.to_owned(),
+        event: event.to_owned(),
+        fields: captures,
+        words: destination_word,
+        context_size,
+    })
 }
 
 pub fn parse_format(format: &str) -> io::Result<Vec<TracepointField>> {
@@ -40,52 +118,9 @@ pub fn generate_selected(
 ) -> io::Result<GeneratedTracepoint> {
     validate_identifier(category, "category")?;
     validate_identifier(event, "event")?;
-    let available: Vec<_> = parse_format(format)?
-        .into_iter()
-        .filter(|field| !field.name.starts_with("common_"))
-        .collect();
-    let fields = match selected {
-        Some(selected) => select_fields(&available, selected)?,
-        None => available,
-    };
-    if fields.is_empty() {
-        return Err(invalid("tracepoint has no event-specific fields"));
-    }
-    for field in &fields {
-        if field.declaration.contains('*')
-            || field.declaration.contains("__data_loc")
-            || field.declaration.contains("__rel_loc")
-            || field.declaration.contains("[]")
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!(
-                    "field {} requires an explicit pointer or dynamic-data policy ({})",
-                    field.name, field.declaration
-                ),
-            ));
-        }
-        if field.array_len.is_none() && !matches!(field.size, 1 | 2 | 4 | 8) {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!(
-                    "field {} has unsupported scalar size {}",
-                    field.name, field.size
-                ),
-            ));
-        }
-    }
-
-    let words = 2 + fields.iter().map(field_words).sum::<usize>();
-    if words * 8 > 384 {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!(
-                "generated {}-byte record exceeds the 384-byte BPF stack budget",
-                words * 8
-            ),
-        ));
-    }
+    let fields = fixed_fields(format, selected)?;
+    let words = MOLD_METADATA_WORDS + fields.iter().map(field_words).sum::<usize>();
+    validate_record_words(words)?;
     let slot_size = 16 + words * 8;
     let per_lane_budget = (64usize << 20) / 8;
     let capacity = previous_power_of_two(per_lane_budget / slot_size).max(1);
@@ -189,6 +224,60 @@ pub fn generate_selected(
         words,
         capacity,
     })
+}
+
+fn fixed_fields(format: &str, selected: Option<&[String]>) -> io::Result<Vec<TracepointField>> {
+    let available: Vec<_> = parse_format(format)?
+        .into_iter()
+        .filter(|field| !field.name.starts_with("common_"))
+        .collect();
+    let fields = match selected {
+        Some(selected) => select_fields(&available, selected)?,
+        None => available,
+    };
+    if fields.is_empty() {
+        return Err(invalid("tracepoint has no event-specific fields"));
+    }
+    for field in &fields {
+        if field.declaration.contains('*')
+            || field.declaration.contains("__data_loc")
+            || field.declaration.contains("__rel_loc")
+            || field.declaration.contains("[]")
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "field {} requires an explicit pointer or dynamic-data policy ({})",
+                    field.name, field.declaration
+                ),
+            ));
+        }
+        if field.array_len.is_none() && !matches!(field.size, 1 | 2 | 4 | 8) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "field {} has unsupported scalar size {}",
+                    field.name, field.size
+                ),
+            ));
+        }
+    }
+    Ok(fields)
+}
+
+fn validate_record_words(words: usize) -> io::Result<()> {
+    let bytes = words
+        .checked_mul(size_of::<u64>())
+        .ok_or_else(|| invalid("Mold record size overflows usize"))?;
+    if bytes > BPF_STACK_RECORD_BUDGET {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "generated {bytes}-byte record exceeds the {BPF_STACK_RECORD_BUDGET}-byte BPF stack budget"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn select_fields(
@@ -409,6 +498,50 @@ format:
         assert!(generated.bpf_c.contains("(const char *)ctx + 56"));
         assert!(generated.bpf_c.contains("(const char *)ctx + 24"));
         compile_generated_rust(&generated.rust);
+    }
+
+    #[test]
+    fn builds_runtime_capture_plan_from_selected_kernel_fields() {
+        let selected = [
+            "prev_pid".to_owned(),
+            "prev_state".to_owned(),
+            "next_pid".to_owned(),
+        ];
+        let plan = capture_plan("sched", "sched_switch", SCHED_SWITCH, Some(&selected)).unwrap();
+
+        assert_eq!(plan.category, "sched");
+        assert_eq!(plan.event, "sched_switch");
+        assert_eq!(plan.words, 5);
+        assert_eq!(plan.context_size, 60);
+        assert_eq!(
+            plan.fields,
+            [
+                CaptureField {
+                    name: "prev_pid".to_owned(),
+                    source_offset: 24,
+                    size: 4,
+                    signed: true,
+                    destination_word: 2,
+                    words: 1,
+                },
+                CaptureField {
+                    name: "prev_state".to_owned(),
+                    source_offset: 32,
+                    size: 8,
+                    signed: true,
+                    destination_word: 3,
+                    words: 1,
+                },
+                CaptureField {
+                    name: "next_pid".to_owned(),
+                    source_offset: 56,
+                    size: 4,
+                    signed: true,
+                    destination_word: 4,
+                    words: 1,
+                },
+            ]
+        );
     }
 
     #[test]

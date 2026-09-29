@@ -195,6 +195,23 @@ their kernel-provided offsets, calculates a power-of-two lane capacity within a
 rejects pointers and `__data_loc` fields because those need an explicit bounded
 read policy like the pathname policy in the `openat` example.
 
+The same validation is available without invoking a compiler. At startup,
+Samurai can discover a capture plan directly from the running kernel:
+
+```rust
+let fields = ["prev_pid", "prev_state", "next_pid"].map(str::to_owned);
+let plan = samurai::tracepoint_schema::CapturePlan::discover(
+    &samurai::utils::tracepoint::TracepointResolver::new(),
+    "sched",
+    "sched_switch",
+    Some(&fields),
+)?;
+```
+
+Each plan fixes the source offset, byte width, signedness, destination Mold
+word, record width, and required tracepoint-context span. Dynamic data and
+pointers remain policy inputs rather than being guessed from kernel metadata.
+
 ### Reproducible transport comparison
 
 `benches/transport_comparison.py` runs alternating paired trials against Aya,
