@@ -1,6 +1,8 @@
 //! Generate fixed Mold schemas from Linux tracepoint format descriptions.
 use std::{collections::HashSet, fmt::Write as _, io};
 
+pub use crate::policy::{CapturePolicy, PointerCapture, PolicyRegistry};
+
 const MOLD_METADATA_WORDS: usize = 2;
 const BPF_STACK_RECORD_BUDGET: usize = 384;
 pub const GENERIC_CAPTURE_WORDS: usize = 34;
@@ -28,129 +30,6 @@ pub enum CaptureKind {
     UserBytes,
     KernelString,
     KernelBytes,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PointerCapture {
-    Address,
-    UserString {
-        max_len: usize,
-    },
-    UserBytes {
-        length_field: &'static str,
-        max_len: usize,
-    },
-    KernelString {
-        max_len: usize,
-    },
-    KernelBytes {
-        length_field: &'static str,
-        max_len: usize,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CapturePolicy {
-    pub category: &'static str,
-    pub event: &'static str,
-    pub field: &'static str,
-    pub capture: PointerCapture,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct PolicyRegistry {
-    policies: &'static [CapturePolicy],
-}
-
-const BUILTIN_POLICIES: &[CapturePolicy] = &[
-    CapturePolicy {
-        category: "syscalls",
-        event: "sys_enter_openat",
-        field: "filename",
-        capture: PointerCapture::UserString { max_len: 128 },
-    },
-    CapturePolicy {
-        category: "syscalls",
-        event: "sys_enter_write",
-        field: "buf",
-        capture: PointerCapture::UserBytes {
-            length_field: "count",
-            max_len: 128,
-        },
-    },
-    CapturePolicy {
-        category: "syscalls",
-        event: "sys_enter_execve",
-        field: "filename",
-        capture: PointerCapture::UserString { max_len: 128 },
-    },
-];
-
-impl PolicyRegistry {
-    pub const fn builtin() -> Self {
-        Self {
-            policies: BUILTIN_POLICIES,
-        }
-    }
-
-    pub const fn empty() -> Self {
-        Self { policies: &[] }
-    }
-
-    pub const fn from_static(policies: &'static [CapturePolicy]) -> Self {
-        Self { policies }
-    }
-
-    fn capture_for(
-        self,
-        category: &str,
-        event: &str,
-        field: &TracepointField,
-        available: &[TracepointField],
-    ) -> io::Result<(PointerCapture, Option<(usize, usize)>)> {
-        let Some(policy) = self.policies.iter().find(|policy| {
-            policy.category == category && policy.event == event && policy.field == field.name
-        }) else {
-            return Ok((PointerCapture::Address, None));
-        };
-        if field.kind != CaptureKind::PointerAddress {
-            return Err(invalid(format!(
-                "policy for {category}:{event}.{} requires a pointer, running kernel declares {}",
-                field.name, field.declaration
-            )));
-        }
-        if !matches!(field.size, 4 | 8) {
-            return Err(invalid(format!(
-                "policy for {category}:{event}.{} requires a 4- or 8-byte pointer",
-                field.name
-            )));
-        }
-        let length = match policy.capture {
-            PointerCapture::UserBytes { length_field, .. }
-            | PointerCapture::KernelBytes { length_field, .. } => {
-                let source = available
-                    .iter()
-                    .find(|candidate| candidate.name == length_field)
-                    .ok_or_else(|| {
-                        invalid(format!(
-                            "policy for {category}:{event}.{} requires missing length field {length_field}",
-                            field.name
-                        ))
-                    })?;
-                if source.kind != CaptureKind::Scalar
-                    || source.signed
-                    || !matches!(source.size, 1 | 2 | 4 | 8)
-                {
-                    return Err(invalid(format!(
-                        "policy length field {length_field} must be an unsigned fixed scalar"
-                    )));
-                }
-                Some((source.offset, source.size))
-            }
-            _ => None,
-        };
-        Ok((policy.capture, length))
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

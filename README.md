@@ -165,6 +165,29 @@ sudo ./target/release/examples/generic_tracepoint \
 These policies dereference pointers only because the syscall ABI identifies
 them as userspace memory. Unrecognized pointers remain numeric addresses.
 
+Inspect the running kernel's resolved layout and capture policy without loading
+or attaching BPF:
+
+```sh
+cargo build --release --example inspect_tracepoint
+sudo ./target/release/examples/inspect_tracepoint \
+  syscalls sys_enter_write fd,buf,count
+```
+
+The output includes each field's source offset, capture kind, fixed Mold width,
+operation count, byte bound, and length-field location. Omitting the field list
+inspects every event-specific field. This preflight view makes pointer
+dereferences and dynamic-location handling visible before attachment.
+
+Find relative dynamic locations provided by the running kernel:
+
+```sh
+sudo ./target/release/examples/inspect_tracepoint --find-relative
+```
+
+The command only scans tracefs format files. It prints `category:event`, field,
+and declaration for every `__rel_loc` candidate and does not load BPF.
+
 The privileged helper compatibility test adapts Aya's normal, truncation,
 empty-string, and invalid-pointer cases and verifies them through Mold:
 
