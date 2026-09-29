@@ -233,12 +233,23 @@ fn context(operation: String, error: io::Error) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{process::Command, sync::OnceLock};
+    use std::{
+        process::Command,
+        sync::{
+            OnceLock,
+            atomic::{AtomicU64, Ordering},
+        },
+    };
 
     fn compile(name: &str, source: &str, debug: bool) -> Vec<u8> {
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("target")
-            .join(format!("object-tests-{}", std::process::id()));
+            .join(format!(
+                "object-test-{}-{}",
+                std::process::id(),
+                NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+            ));
         fs::create_dir_all(&dir).unwrap();
         let input = dir.join(format!("{name}.c"));
         let output = dir.join(format!("{name}.o"));
@@ -259,7 +270,9 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );
-        fs::read(output).unwrap()
+        let bytes = fs::read(output).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        bytes
     }
 
     fn fixture() -> &'static [u8] {

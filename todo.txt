@@ -16,3 +16,15 @@ Dynamic string transport CPU profiling
 - Test an adaptive empty-lane backoff that spins briefly while active and
   backs off only after repeated empty polls. Measure throughput, task clock,
   context switches, latency, backlog, and loss before keeping it.
+
+RelativeDataLoc live compatibility validation
+
+- The Asahi kernel currently exposes zero `__rel_loc` tracepoint fields, so
+  the existing parser and capture-plan support cannot be exercised against a
+  naturally available event on this machine.
+- Add a synthetic verifier fixture containing relative dynamic data.
+- Validate the complete path: relative locator decoding, bounded offset and
+  length calculation, generic BPF capture, Mold delivery, and userspace
+  decoding.
+- Keep the existing unit coverage, and complete this fixture before claiming
+  full generic tracepoint compatibility or publishing a release.
