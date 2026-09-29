@@ -62,12 +62,29 @@ pub struct PolicyRegistry {
     policies: &'static [CapturePolicy],
 }
 
-const BUILTIN_POLICIES: &[CapturePolicy] = &[CapturePolicy {
-    category: "syscalls",
-    event: "sys_enter_openat",
-    field: "filename",
-    capture: PointerCapture::UserString { max_len: 128 },
-}];
+const BUILTIN_POLICIES: &[CapturePolicy] = &[
+    CapturePolicy {
+        category: "syscalls",
+        event: "sys_enter_openat",
+        field: "filename",
+        capture: PointerCapture::UserString { max_len: 128 },
+    },
+    CapturePolicy {
+        category: "syscalls",
+        event: "sys_enter_write",
+        field: "buf",
+        capture: PointerCapture::UserBytes {
+            length_field: "count",
+            max_len: 128,
+        },
+    },
+    CapturePolicy {
+        category: "syscalls",
+        event: "sys_enter_execve",
+        field: "filename",
+        capture: PointerCapture::UserString { max_len: 128 },
+    },
+];
 
 impl PolicyRegistry {
     pub const fn builtin() -> Self {
@@ -1193,6 +1210,65 @@ field:int flags; offset:32; size:8; signed:0;
                 auxiliary_size: 0,
             }
         );
+    }
+
+    #[test]
+    fn builtin_write_policy_uses_count_to_bound_user_bytes() {
+        let format = r#"
+field:unsigned short common_type; offset:0; size:2; signed:0;
+field:unsigned int fd; offset:16; size:8; signed:0;
+field:const char * buf; offset:24; size:8; signed:0;
+field:size_t count; offset:32; size:8; signed:0;
+"#;
+        let selected = ["buf".to_owned()];
+        let plan = capture_plan_with_registry(
+            "syscalls",
+            "sys_enter_write",
+            format,
+            Some(&selected),
+            DEFAULT_DYNAMIC_CAPTURE_BYTES,
+            PolicyRegistry::builtin(),
+        )
+        .unwrap();
+
+        assert_eq!(plan.fields[0].kind, CaptureKind::UserBytes);
+        assert_eq!(plan.fields[0].capture_size, 128);
+        assert_eq!(plan.fields[0].length_source, Some((32, 8)));
+        let operations = plan.operations().unwrap();
+        assert_eq!(operations.len(), 17);
+        assert_eq!(
+            operations[0].flags,
+            CAPTURE_POINTER_BYTES | CAPTURE_DYNAMIC_METADATA
+        );
+        assert_eq!(operations[0].auxiliary_offset, 32);
+        assert_eq!(operations[0].auxiliary_size, 8);
+        assert_eq!(operations[1].flags, CAPTURE_POINTER_BYTES);
+    }
+
+    #[test]
+    fn builtin_execve_policy_lowers_filename_as_user_string() {
+        let format = r#"
+field:unsigned short common_type; offset:0; size:2; signed:0;
+field:const char * filename; offset:16; size:8; signed:0;
+field:const char *const * argv; offset:24; size:8; signed:0;
+field:const char *const * envp; offset:32; size:8; signed:0;
+"#;
+        let selected = ["filename".to_owned()];
+        let plan = capture_plan_with_registry(
+            "syscalls",
+            "sys_enter_execve",
+            format,
+            Some(&selected),
+            DEFAULT_DYNAMIC_CAPTURE_BYTES,
+            PolicyRegistry::builtin(),
+        )
+        .unwrap();
+
+        assert_eq!(plan.fields[0].kind, CaptureKind::UserString);
+        let operation = plan.operations().unwrap()[0];
+        assert_eq!(operation.flags, CAPTURE_USER_STRING);
+        assert_eq!(operation.pointer_size, 8);
+        assert_eq!(operation.size, 128);
     }
 
     #[test]

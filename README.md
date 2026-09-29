@@ -148,6 +148,23 @@ The generic reader captures up to 127 pathname bytes plus the terminator and
 reports helper errors separately from empty strings. No handwritten openat BPF
 producer or record layout remains.
 
+The built-in policy registry also understands byte buffers for `write(2)` and
+filenames for `execve(2)`. The write policy uses the syscall's `count` field as
+the authoritative length and caps capture at 128 bytes:
+
+```sh
+sudo ./target/release/examples/generic_tracepoint \
+  target/generic-tracepoint.bpf.o \
+  syscalls sys_enter_write fd,buf,count 5
+
+sudo ./target/release/examples/generic_tracepoint \
+  target/generic-tracepoint.bpf.o \
+  syscalls sys_enter_execve filename 5
+```
+
+These policies dereference pointers only because the syscall ABI identifies
+them as userspace memory. Unrecognized pointers remain numeric addresses.
+
 The privileged helper compatibility test adapts Aya's normal, truncation,
 empty-string, and invalid-pointer cases and verifies them through Mold:
 
