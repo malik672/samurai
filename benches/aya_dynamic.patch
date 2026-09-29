@@ -1,0 +1,151 @@
+diff --git a/aya/Cargo.toml b/aya/Cargo.toml
+index 42e96494..8dd9748f 100644
+--- a/aya/Cargo.toml
++++ b/aya/Cargo.toml
+@@ -32,6 +32,7 @@ scopeguard = { workspace = true }
+ thiserror = { workspace = true }
+ 
+ [dev-dependencies]
++integration-common = { path = "../test/integration-common", features = ["user"] }
+ nix = { workspace = true, features = ["net", "socket"] }
+ rstest = { workspace = true }
+ tempfile = { workspace = true }
+diff --git a/aya/src/programs/trace_point.rs b/aya/src/programs/trace_point.rs
+index 0dad511a..70cbbfa1 100644
+--- a/aya/src/programs/trace_point.rs
++++ b/aya/src/programs/trace_point.rs
+@@ -12,10 +12,10 @@ use crate::{
+     programs::{
+         ProgramData, ProgramError, ProgramType, define_link_wrapper, impl_try_from_fdlink,
+         impl_try_into_fdlink, load_program_without_attach_type,
+-        perf_attach::{PerfLinkIdInner, PerfLinkInner, perf_attach},
++        perf_attach::{PerfLinkIdInner, PerfLinkInner, attach_perf_event, perf_attach},
+         utils::find_tracefs_path,
+     },
+-    sys::{SyscallError, perf_event_open_trace_point},
++    sys::{SyscallError, perf_event_open_trace_point, perf_event_open_trace_point_on_cpu},
+ };
+ 
+ /// The type returned when attaching a [`TracePoint`] fails.
+@@ -76,11 +76,42 @@ impl TracePoint {
+     ///
+     /// The returned value can be used to detach, see [`TracePoint::detach`].
+     pub fn attach(&mut self, category: &str, name: &str) -> Result<TracePointLinkId, ProgramError> {
++        self.attach_to_pid(category, name, None)
++    }
++
++    /// Attaches to a tracepoint for all tasks on one CPU.
++    pub fn attach_to_cpu(
++        &mut self,
++        category: &str,
++        name: &str,
++        cpu: u32,
++    ) -> Result<TracePointLinkId, ProgramError> {
++        let prog_fd = self.fd()?.as_fd();
++        let tracefs = find_tracefs_path()?;
++        let id = read_sys_fs_trace_point_id(tracefs, category, name.as_ref())?;
++        let perf_fd =
++            perf_event_open_trace_point_on_cpu(id, cpu).map_err(|io_error| SyscallError {
++                call: "perf_event_open_trace_point",
++                io_error,
++            })?;
++        // Preserve perf_event's CPU scope. BPF perf links on this kernel make
++        // each tracepoint attachment effectively global, causing N program
++        // copies to emit every event N times.
++        let link = attach_perf_event(prog_fd, perf_fd, None).map(PerfLinkInner::PerfLink)?;
++        self.data.links.insert(TracePointLink::new(link))
++    }
++
++    fn attach_to_pid(
++        &mut self,
++        category: &str,
++        name: &str,
++        pid: Option<u32>,
++    ) -> Result<TracePointLinkId, ProgramError> {
+         let prog_fd = self.fd()?;
+         let prog_fd = prog_fd.as_fd();
+         let tracefs = find_tracefs_path()?;
+         let id = read_sys_fs_trace_point_id(tracefs, category, name.as_ref())?;
+-        let perf_fd = perf_event_open_trace_point(id, None).map_err(|io_error| SyscallError {
++        let perf_fd = perf_event_open_trace_point(id, pid).map_err(|io_error| SyscallError {
+             call: "perf_event_open_trace_point",
+             io_error,
+         })?;
+diff --git a/aya/src/sys/perf_event.rs b/aya/src/sys/perf_event.rs
+index 18413227..24ca1ea3 100644
+--- a/aya/src/sys/perf_event.rs
++++ b/aya/src/sys/perf_event.rs
+@@ -205,6 +205,20 @@ pub(crate) fn perf_event_open_trace_point(
+     )
+ }
+ 
++pub(crate) fn perf_event_open_trace_point_on_cpu(
++    event_id: u64,
++    cpu: u32,
++) -> io::Result<crate::MockableFd> {
++    perf_event_open(
++        PerfEventConfig::TracePoint { event_id },
++        PerfEventScope::AllProcessesOneCpu { cpu },
++        SamplePolicy::Period(0),
++        WakeupPolicy::Events(1),
++        false,
++        PERF_FLAG_FD_CLOEXEC,
++    )
++}
++
+ pub(crate) fn perf_event_ioctl(
+     fd: BorrowedFd<'_>,
+     request: PerfEventIoctlRequest<'_>,
+diff --git a/test/integration-common/src/lib.rs b/test/integration-common/src/lib.rs
+index 67d41e68..f1a9fd78 100644
+--- a/test/integration-common/src/lib.rs
++++ b/test/integration-common/src/lib.rs
+@@ -148,6 +148,48 @@ pub mod ring_buf {
+     unsafe impl aya::Pod for Registers {}
+ }
+ 
++pub mod mold_bench {
++    pub const SHARDS: usize = 4;
++    pub const TASK_SLOTS: usize = 65_536;
++
++    #[repr(C)]
++    #[derive(Clone, Copy, Debug, Default)]
++    pub struct Event {
++        pub timestamp_ns: u64,
++        pub previous_pid: u32,
++        pub next_pid: u32,
++        pub cpu: u32,
++        pub reserved: u32,
++        pub previous_state: i64,
++    }
++
++    #[cfg(feature = "user")]
++    unsafe impl aya::Pod for Event {}
++
++    #[repr(C)]
++    #[derive(Clone, Copy)]
++    pub struct DynamicEvent {
++        pub timestamp_ns: u64,
++        pub result: i64,
++        pub payload: [u8; 128],
++    }
++
++    #[cfg(feature = "user")]
++    unsafe impl aya::Pod for DynamicEvent {}
++
++    #[repr(C)]
++    #[derive(Clone, Copy, Default)]
++    pub struct DynamicConfig {
++        pub pid: u32,
++        pub pointer_offset: u32,
++        pub length_offset: u32,
++        pub mode: u32,
++    }
++
++    #[cfg(feature = "user")]
++    unsafe impl aya::Pod for DynamicConfig {}
++}
++
+ pub mod strncmp {
+     #[derive(Copy, Clone)]
+     #[repr(C)]
