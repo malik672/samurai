@@ -10,14 +10,27 @@ use samurai::{
 use std::{collections::BTreeMap, ffi::CString, io};
 
 fn main() -> io::Result<()> {
-    // The legacy tracepoint perf event is opened on CPU 0. Keep this focused
-    // helper test on that CPU so its four syscalls cannot race attachment
-    // propagation while the assertions are running.
-    pin_current_thread(0)?;
-    let object = std::env::args().nth(1).ok_or_else(|| {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.is_empty() || args.len() > 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "usage: openat_helper_test <generic-tracepoint.bpf.o> [cpu=0]",
+        ));
+    }
+    let cpu = args
+        .get(1)
+        .map(|value| value.parse::<usize>())
+        .transpose()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
+        .unwrap_or(0);
+    // Pin before discovery, loading, attachment, and the four target syscalls.
+    // This prevents scheduler migration from moving a syscall away while the
+    // focused compatibility assertions are running.
+    pin_current_thread(cpu)?;
+    let object = args.first().cloned().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: openat_helper_test <generic-tracepoint.bpf.o>",
+            "missing generic tracepoint object",
         )
     })?;
     let resolver = TracepointResolver::new();
@@ -137,8 +150,8 @@ fn main() -> io::Result<()> {
     assert_eq!(records[3].0, b"");
     assert!(records[3].1 < 0);
     println!(
-        "openat helper cases passed: normal, truncated, empty, invalid-pointer error={}",
-        records[3].1
+        "openat helper cases passed on CPU {cpu}: normal, truncated, empty, invalid-pointer error={}",
+        records[3].1,
     );
     Ok(())
 }

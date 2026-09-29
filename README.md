@@ -158,8 +158,12 @@ clang -target bpfel -mcpu=v3 -O2 -I examples/bpf \
   -o target/generic-tracepoint.bpf.o
 cargo build --release --example openat_helper_test
 sudo ./target/release/examples/openat_helper_test \
-  target/generic-tracepoint.bpf.o
+  target/generic-tracepoint.bpf.o 0
 ```
+
+The optional final argument selects the CPU for the entire test process. It
+defaults to CPU 0 and is applied before discovery, loading, attachment, and the
+four target syscalls.
 
 ### Generate a tracepoint schema
 
