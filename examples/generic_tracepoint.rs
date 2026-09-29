@@ -55,7 +55,12 @@ fn main() -> io::Result<()> {
     let attachment = program.attach(&resolver, category, event)?;
 
     let deadline = Instant::now() + Duration::from_secs(seconds);
-    let (mut received, mut dropped, mut printed) = (0u64, 0u64, 0usize);
+    let (mut received, mut dropped) = (0u64, 0u64);
+    // Allocate preview storage before capture starts. Printing while attached to
+    // sys_enter_write would generate another write event and recursively trace
+    // Samurai's own output.
+    const PREVIEW_RECORDS: usize = 20;
+    let mut preview = Vec::with_capacity(PREVIEW_RECORDS);
     while Instant::now() < deadline {
         let mut progressed = false;
         for worker in &mut workers {
@@ -63,9 +68,8 @@ fn main() -> io::Result<()> {
                 Some(MoldEntry::Data(words)) => {
                     received += 1;
                     progressed = true;
-                    if printed < 20 {
-                        print_record(&plan, &words);
-                        printed += 1;
+                    if preview.len() < PREVIEW_RECORDS {
+                        preview.push(words);
                     }
                 }
                 Some(MoldEntry::Gap(missed)) => {
@@ -81,6 +85,36 @@ fn main() -> io::Result<()> {
         }
     }
     drop(attachment);
+    loop {
+        let mut progressed = false;
+        for worker in &mut workers {
+            match worker.try_next()? {
+                Some(MoldEntry::Data(words)) => {
+                    received += 1;
+                    progressed = true;
+                    if preview.len() < PREVIEW_RECORDS {
+                        preview.push(words);
+                    }
+                }
+                Some(MoldEntry::Gap(missed)) => {
+                    dropped += missed;
+                    progressed = true;
+                }
+                Some(MoldEntry::Done) => progressed = true,
+                None => {}
+            }
+        }
+        let mut caught_up = true;
+        for worker in &workers {
+            caught_up &= worker.is_caught_up()?;
+        }
+        if !progressed && caught_up {
+            break;
+        }
+    }
+    for words in &preview {
+        print_record(&plan, words);
+    }
     println!(
         "event={category}:{event} received={received} dropped={dropped} words={} operations={}",
         plan.words,
