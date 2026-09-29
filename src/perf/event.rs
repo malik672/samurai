@@ -45,9 +45,17 @@ struct PerfEventAttr {
     config1: u64,
 }
 
-/// Open the perf event used to register a global BPF tracepoint attachment.
-/// CPU 0 is only the carrier; the attached program runs on every firing CPU.
+/// Open the perf event for all tasks executing on CPU 0.
 pub fn open_tracepoint(tracepoint_id: u64) -> io::Result<OwnedFd> {
+    open_tracepoint_for(tracepoint_id, -1, 0)
+}
+
+/// Open the perf event for one Linux thread on any CPU.
+pub fn open_tracepoint_for_thread(tracepoint_id: u64, tid: u32) -> io::Result<OwnedFd> {
+    open_tracepoint_for(tracepoint_id, tid as i32, -1)
+}
+
+fn open_tracepoint_for(tracepoint_id: u64, pid: i32, cpu: i32) -> io::Result<OwnedFd> {
     let attr = PerfEventAttr {
         type_: PERF_TYPE_TRACEPOINT,
         size: PERF_ATTR_SIZE_VER0,
@@ -61,8 +69,8 @@ pub fn open_tracepoint(tracepoint_id: u64) -> io::Result<OwnedFd> {
         libc::syscall(
             libc::SYS_perf_event_open,
             &attr as *const PerfEventAttr,
-            -1i32, // pid: all tasks
-            0i32,
+            pid,
+            cpu,
             -1i32,     // no event group
             1u64 << 3, // PERF_FLAG_FD_CLOEXEC
         )

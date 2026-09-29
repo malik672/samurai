@@ -34,4 +34,19 @@ impl TracePoint {
         event::enable_event(&perf_fd)?;
         Ok(perf_fd)
     }
+
+    /// Attach this program to one Linux thread, wherever that thread runs.
+    pub fn attach_to_thread(
+        &self,
+        resolver: &TracepointResolver,
+        category: &str,
+        name: &str,
+        tid: u32,
+    ) -> io::Result<OwnedFd> {
+        let tracepoint = resolver.open(category, name)?;
+        let perf_fd = event::open_tracepoint_for_thread(tracepoint.id, tid)?;
+        event::attach_bpf(&perf_fd, &self.fd)?;
+        event::enable_event(&perf_fd)?;
+        Ok(perf_fd)
+    }
 }
