@@ -188,6 +188,28 @@ sudo ./target/release/examples/inspect_tracepoint --find-relative
 The command only scans tracefs format files. It prints `category:event`, field,
 and declaration for every `__rel_loc` candidate and does not load BPF.
 
+### Controlled dynamic transport benchmark
+
+Compare Aya RingBuf and Mold while both capture the same 128-byte user string
+or byte buffer from controlled syscall producers:
+
+```sh
+sudo python3 benches/dynamic_transport_comparison.py \
+  --pairs 10 --calls 100000 \
+  --producer-cpus 0,1,2,3 --consumer-cpus 5,4,6,7
+```
+
+The harness alternates run order, records perf counters and maximum RSS, checks
+complete received/drop accounting, and writes raw measurements plus system and
+compiler metadata under `target/dynamic-transport-comparison/`. The scalar
+baseline remains `benches/transport_comparison.py`, so its established fixture
+and historical results are unchanged.
+
+The Aya eBPF build requires `bpf-linker` to use the same LLVM major version as
+the installed nightly Rust toolchain. The harness stops during its build phase
+if those versions differ; update one side before collecting results rather than
+reusing a stale BPF object.
+
 The privileged helper compatibility test adapts Aya's normal, truncation,
 empty-string, and invalid-pointer cases and verifies them through Mold:
 
