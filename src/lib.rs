@@ -1,5 +1,6 @@
 pub mod aggregate;
 pub mod bpf;
+pub mod cli;
 pub mod mold;
 pub mod perf;
 pub mod policy;

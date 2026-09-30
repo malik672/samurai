@@ -43,6 +43,51 @@ impl TracepointResolver {
         fs::read_to_string(&path).map_err(|err| path_error(&path, err))
     }
 
+    /// List tracepoints exposed by the mounted tracefs instance.
+    pub fn list(&self, category: Option<&str>) -> io::Result<Vec<(String, String)>> {
+        let root = self
+            .root
+            .get_or_init(tracing_root)
+            .as_ref()
+            .map_err(|error| io::Error::new(error.kind(), error.to_string()))?
+            .join("events");
+        let categories = match category {
+            Some(category) => {
+                if !valid_component(category) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "tracepoint category must contain only ASCII letters, digits, or underscores",
+                    ));
+                }
+                vec![root.join(category)]
+            }
+            None => fs::read_dir(&root)?
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                .map(|entry| entry.path())
+                .collect(),
+        };
+        let mut events = Vec::new();
+        for category_path in categories {
+            let Some(category_name) = category_path.file_name().and_then(|name| name.to_str())
+            else {
+                continue;
+            };
+            for event in fs::read_dir(&category_path)? {
+                let event = event?;
+                if !event.file_type()?.is_dir() || !event.path().join("format").is_file() {
+                    continue;
+                }
+                let Some(event_name) = event.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                events.push((category_name.to_owned(), event_name));
+            }
+        }
+        events.sort_unstable();
+        Ok(events)
+    }
+
     fn event_path(&self, category: &str, name: &str) -> io::Result<std::path::PathBuf> {
         if !valid_component(category) || !valid_component(name) {
             return Err(io::Error::new(

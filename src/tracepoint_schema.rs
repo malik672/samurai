@@ -1,5 +1,5 @@
 //! Generate fixed Mold schemas from Linux tracepoint format descriptions.
-use std::{collections::HashSet, fmt::Write as _, io};
+use std::{fmt::Write as _, io};
 
 pub use crate::policy::{CapturePolicy, PointerCapture, PolicyRegistry};
 
@@ -140,6 +140,15 @@ impl CapturePlan {
 
     /// Lower fields into bounded operations understood by the generic BPF reader.
     pub fn operations(&self) -> io::Result<Vec<CaptureOperation>> {
+        if self.words > GENERIC_CAPTURE_WORDS {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "capture needs {} Mold words; generic reader supports {GENERIC_CAPTURE_WORDS}",
+                    self.words
+                ),
+            ));
+        }
         let mut operations = Vec::new();
         for field in &self.fields {
             if matches!(
@@ -340,15 +349,15 @@ pub fn capture_plan_with_registry(
     if dynamic_capture_bytes == 0 {
         return Err(invalid("dynamic capture bound must be nonzero"));
     }
-    let available = parse_format(format)?;
-    let fields = selected_fields(format, selected)?;
+    let parsed = parse_format(format)?;
+    let fields = selected_field_refs(&parsed, selected)?;
     let mut destination_word = MOLD_METADATA_WORDS;
     let mut captures = Vec::with_capacity(fields.len());
     let mut context_size = 0;
-    for mut field in fields {
+    for field in fields {
         let (pointer_capture, length_source) =
-            policies.capture_for(category, event, &field, &available)?;
-        field.kind = match pointer_capture {
+            policies.capture_for(category, event, field, &parsed)?;
+        let kind = match pointer_capture {
             PointerCapture::UserString { .. } => CaptureKind::UserString,
             PointerCapture::UserBytes { .. } => CaptureKind::UserBytes,
             PointerCapture::KernelString { .. } => CaptureKind::KernelString,
@@ -361,16 +370,13 @@ pub fn capture_plan_with_registry(
         | PointerCapture::KernelBytes { max_len, .. } = pointer_capture
         {
             max_len
-        } else if matches!(
-            field.kind,
-            CaptureKind::DataLoc | CaptureKind::RelativeDataLoc
-        ) {
+        } else if matches!(kind, CaptureKind::DataLoc | CaptureKind::RelativeDataLoc) {
             dynamic_capture_bytes
         } else {
             0
         };
         let words = if capture_size == 0 {
-            field_words(&field)
+            field_words(field)
         } else {
             1 + capture_size.div_ceil(8)
         };
@@ -381,13 +387,13 @@ pub fn capture_plan_with_registry(
                 .ok_or_else(|| invalid("tracepoint field extent overflows usize"))?,
         );
         captures.push(CaptureField {
-            name: field.name,
+            name: field.name.clone(),
             source_offset: field.offset,
             size: field.size,
             signed: field.signed,
             destination_word,
             words,
-            kind: field.kind,
+            kind,
             capture_size,
             length_source,
         });
@@ -538,7 +544,11 @@ pub fn generate_selected(
 }
 
 fn fixed_fields(format: &str, selected: Option<&[String]>) -> io::Result<Vec<TracepointField>> {
-    let fields = selected_fields(format, selected)?;
+    let available = parse_format(format)?;
+    let fields: Vec<TracepointField> = selected_field_refs(&available, selected)?
+        .into_iter()
+        .cloned()
+        .collect();
     for field in &fields {
         if matches!(
             field.kind,
@@ -556,14 +566,16 @@ fn fixed_fields(format: &str, selected: Option<&[String]>) -> io::Result<Vec<Tra
     Ok(fields)
 }
 
-fn selected_fields(format: &str, selected: Option<&[String]>) -> io::Result<Vec<TracepointField>> {
-    let available: Vec<_> = parse_format(format)?
-        .into_iter()
-        .filter(|field| !field.name.starts_with("common_"))
-        .collect();
+fn selected_field_refs<'a>(
+    available: &'a [TracepointField],
+    selected: Option<&[String]>,
+) -> io::Result<Vec<&'a TracepointField>> {
     let fields = match selected {
-        Some(selected) => select_fields(&available, selected)?,
-        None => available,
+        Some(selected) => select_named_fields(available, selected)?,
+        None => available
+            .iter()
+            .filter(|field| !field.name.starts_with("common_"))
+            .collect(),
     };
     if fields.is_empty() {
         return Err(invalid("tracepoint has no event-specific fields"));
@@ -586,25 +598,25 @@ fn validate_record_words(words: usize) -> io::Result<()> {
     Ok(())
 }
 
-fn select_fields(
-    available: &[TracepointField],
+fn select_named_fields<'a>(
+    available: &'a [TracepointField],
     selected: &[String],
-) -> io::Result<Vec<TracepointField>> {
+) -> io::Result<Vec<&'a TracepointField>> {
     if selected.is_empty() {
         return Err(invalid("field selection cannot be empty"));
     }
-    let mut seen = HashSet::new();
     selected
         .iter()
-        .map(|name| {
+        .enumerate()
+        .map(|(index, name)| {
             validate_identifier(name, "selected field")?;
-            if !seen.insert(name.as_str()) {
+            if selected[..index].iter().any(|seen| seen == name) {
                 return Err(invalid(format!("field {name} was selected more than once")));
             }
             available
                 .iter()
+                .filter(|field| !field.name.starts_with("common_"))
                 .find(|field| field.name == *name)
-                .cloned()
                 .ok_or_else(|| invalid(format!("tracepoint has no field named {name}")))
         })
         .collect()

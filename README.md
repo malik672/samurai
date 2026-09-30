@@ -18,6 +18,40 @@ end of loading. Returned program handles contain only kernel FDs, with no
 instruction copies or reference counting. A failure drops already-created
 programs and maps; retry by parsing the object again.
 
+## Command-line interface
+
+The `samurai` binary discovers events from the running kernel, derives capture
+plans from tracefs, and embeds the generic BPF reader in the executable:
+
+```sh
+cargo build --release --bin samurai
+```
+
+The default embedded Mold object supports eight CPUs and retains 16,384 records
+per lane. Set `SAMURAI_MOLD_LANES` and `SAMURAI_MOLD_CAPACITY` while building to
+change those dimensions; capacity must be a power of two.
+
+Discover, inspect, validate, and then record an event:
+
+```sh
+./target/release/samurai list sched
+./target/release/samurai inspect sched:sched_switch
+./target/release/samurai validate sched:sched_switch \
+  --fields prev_pid,next_pid,prev_state
+sudo ./target/release/samurai trace sched:sched_switch \
+  --fields prev_pid,next_pid,prev_state --duration 10s
+sudo ./target/release/samurai trace syscalls:sys_enter_openat \
+  --fields filename,flags,mode --count 100 --cpus 0-3 --format json
+```
+
+`trace` records on all online CPUs by default and stops when `--count` or
+`--duration` is reached, or on Ctrl-C. It prints up to 20 sample records after
+detaching, plus the total received and dropped counts. Delayed output avoids
+recursively recording Samurai's own writes when tracing syscall events. Use
+`--object PATH` only to override the embedded generic BPF object. `inspect` and
+`validate` read the running kernel's tracepoint format; neither attaches BPF.
+Run `samurai --help` for the full command syntax.
+
 Use `loaded.program(name)` and call its `attach()` method. There is no separate
 program `load()` call. Array-map operations live in `src/bpf/map.rs`; program
 loading and attachment live in `src/bpf/program.rs`.

@@ -11,5 +11,6 @@ path = "benches/tracepoint_read.rs"
 
 [dependencies]
 aya-obj = "0.3"
+clap = { version = "4", features = ["derive"] }
 libc = "0.2.189"
 rustc-hash = "2"
