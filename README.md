@@ -12,9 +12,6 @@ Samurai can currently answer questions such as:
 - Which tracepoint field values occurred most frequently?
 - How many records were lost because the consumer fell behind?
 
-Samurai is not yet a replacement for `perf` or Samply. CPU sampling, stack
-capture, symbolization, and flamegraphs are not implemented.
-
 ## Requirements
 
 - Linux on a little-endian architecture
