@@ -117,25 +117,6 @@ The default embedded object retains 16,384 records per selected CPU and uses
 approximately 5 MiB per CPU. Set `SAMURAI_MOLD_CAPACITY` at build time to
 choose another power-of-two capacity.
 
-## Benchmarks
-
-```sh
-sudo python3 benches/transport_comparison.py --scenario both --pairs 20
-sudo python3 benches/dynamic_transport_comparison.py --pairs 10 --calls 100000
-```
-
-See [benches/DYNAMIC_TRANSPORT.md](benches/DYNAMIC_TRANSPORT.md) for the dynamic
-benchmark methodology and limitations. Compare results only within the same
-scenario and run.
-
-## Tests
-
-```sh
-cargo test --all-targets
-```
-
-Some live BPF tests and benchmarks require Linux privileges.
-
 ## License
 
 Samurai uses `aya-obj` for ELF parsing and relocations, but its own Linux
