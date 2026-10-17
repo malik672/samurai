@@ -11,21 +11,23 @@ use aya_obj::{EbpfSectionKind, Object, ProgramSection, maps::PinningType};
 use rustc_hash::FxHashMap;
 
 use super::{
-    map::{ArrayMap, LruPerCpuHashMap, PerCpuArrayMap, RingBufferMap},
+    map::{ArrayMap, HashMap, LruPerCpuHashMap, PerCpuArrayMap, RingBufferMap},
     program::TracePoint,
     syscall::{
-        BPF_F_MMAPABLE, BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_LRU_PERCPU_HASH,
+        BPF_F_MMAPABLE, BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_HASH, BPF_MAP_TYPE_LRU_PERCPU_HASH,
         BPF_MAP_TYPE_PERCPU_ARRAY, BPF_MAP_TYPE_RINGBUF,
     },
 };
 
 pub struct ObjectLoader {
     object: Object,
+    repeated_programs: Vec<(String, usize)>,
 }
 
 pub struct LoadedObject {
     programs: FxHashMap<String, TracePoint>,
     array_maps: FxHashMap<String, ArrayMap>,
+    hash_maps: FxHashMap<String, HashMap>,
     per_cpu_array_maps: FxHashMap<String, PerCpuArrayMap>,
     lru_per_cpu_hash_maps: FxHashMap<String, LruPerCpuHashMap>,
     ring_buffer_maps: FxHashMap<String, RingBufferMap>,
@@ -63,7 +65,7 @@ impl ObjectLoader {
         }
         for (name, map) in &object.maps {
             let valid_shape = match map.map_type() {
-                BPF_MAP_TYPE_ARRAY | BPF_MAP_TYPE_PERCPU_ARRAY => {
+                BPF_MAP_TYPE_ARRAY | BPF_MAP_TYPE_PERCPU_ARRAY | BPF_MAP_TYPE_HASH => {
                     map.key_size() == 4 && map.value_size() != 0
                 }
                 BPF_MAP_TYPE_LRU_PERCPU_HASH => map.key_size() != 0 && map.value_size() != 0,
@@ -87,7 +89,10 @@ impl ObjectLoader {
                 )));
             }
         }
-        Ok(Self { object })
+        Ok(Self {
+            object,
+            repeated_programs: Vec::new(),
+        })
     }
 
     pub fn from_file(path: impl AsRef<Path>) -> io::Result<Self> {
@@ -102,10 +107,80 @@ impl ObjectLoader {
         self.object.maps.keys().map(String::as_str)
     }
 
+    /// Resize Mold's lane-indexed maps while preserving the compiled capacity.
+    pub fn configure_mold(&mut self, lanes: usize, highest_cpu: usize) -> io::Result<()> {
+        if lanes == 0 {
+            return Err(invalid_data("Mold requires at least one selected CPU"));
+        }
+        let frontier_entries = self
+            .object
+            .maps
+            .get("frontiers")
+            .ok_or_else(|| invalid_data("missing frontiers map"))?
+            .max_entries();
+        let slot_entries = self
+            .object
+            .maps
+            .get("slots")
+            .ok_or_else(|| invalid_data("missing slots map"))?
+            .max_entries();
+        if frontier_entries == 0 || !slot_entries.is_multiple_of(frontier_entries) {
+            return Err(invalid_data("invalid compiled Mold map dimensions"));
+        }
+        let capacity = slot_entries / frontier_entries;
+        let lanes = u32::try_from(lanes).map_err(|_| invalid_data("too many Mold lanes"))?;
+        let slots = lanes
+            .checked_mul(capacity)
+            .ok_or_else(|| invalid_data("Mold slot count overflow"))?;
+        let cpu_entries = u32::try_from(highest_cpu)
+            .ok()
+            .and_then(|cpu| cpu.checked_add(1))
+            .ok_or_else(|| invalid_data("CPU number is too large"))?;
+        self.object
+            .maps
+            .get_mut("frontiers")
+            .expect("frontiers was checked above")
+            .set_max_entries(lanes);
+        self.object
+            .maps
+            .get_mut("slots")
+            .expect("slots was checked above")
+            .set_max_entries(slots);
+        self.object
+            .maps
+            .get_mut("cpu_to_lane")
+            .ok_or_else(|| invalid_data("missing cpu_to_lane map"))?
+            .set_max_entries(cpu_entries);
+        Ok(())
+    }
+
+    /// Replace one program definition with independently loaded instances.
+    pub fn repeat_program(&mut self, name: &str, instances: usize) -> io::Result<Vec<String>> {
+        if instances == 0 {
+            return Err(invalid_data("at least one program instance is required"));
+        }
+        if !self.object.programs.contains_key(name) {
+            return Err(invalid_data(format!("missing program {name}")));
+        }
+        let names = (0..instances)
+            .map(|index| format!("{name}_{index}"))
+            .collect::<Vec<_>>();
+        if self
+            .repeated_programs
+            .iter()
+            .any(|(repeated, _)| repeated == name)
+        {
+            return Err(invalid_data(format!("program {name} is already repeated")));
+        }
+        self.repeated_programs.push((name.to_owned(), instances));
+        Ok(names)
+    }
+
     /// Create maps, relocate and load all programs, then drop parsed data.
     pub fn load(mut self) -> io::Result<LoadedObject> {
         // Like Aya, transfer map definitions into the runtime map objects.
         let mut array_maps = FxHashMap::default();
+        let mut hash_maps = FxHashMap::default();
         let mut per_cpu_array_maps = FxHashMap::default();
         let mut lru_per_cpu_hash_maps = FxHashMap::default();
         let mut ring_buffer_maps = FxHashMap::default();
@@ -115,6 +190,11 @@ impl ObjectLoader {
                     let map = ArrayMap::create(map_obj)
                         .map_err(|err| context(format!("create map {name}"), err))?;
                     array_maps.insert(name, map);
+                }
+                BPF_MAP_TYPE_HASH => {
+                    let map = HashMap::create(map_obj)
+                        .map_err(|err| context(format!("create map {name}"), err))?;
+                    hash_maps.insert(name, map);
                 }
                 BPF_MAP_TYPE_PERCPU_ARRAY => {
                     let map = PerCpuArrayMap::create(map_obj)
@@ -151,6 +231,11 @@ impl ObjectLoader {
                             .map(|(name, map)| (name.as_str(), map.fd().as_raw_fd(), map.obj())),
                     )
                     .chain(
+                        hash_maps
+                            .iter()
+                            .map(|(name, map)| (name.as_str(), map.fd().as_raw_fd(), map.obj())),
+                    )
+                    .chain(
                         per_cpu_array_maps
                             .iter()
                             .map(|(name, map)| (name.as_str(), map.fd().as_raw_fd(), map.obj())),
@@ -167,15 +252,36 @@ impl ObjectLoader {
             .relocate_calls(&sections)
             .map_err(invalid_data)?;
 
-        let programs = load_programs(self.object, TracePoint::load)?;
+        let programs =
+            load_repeated_programs(self.object, self.repeated_programs, TracePoint::load)?;
         Ok(LoadedObject {
             programs,
             array_maps,
+            hash_maps,
             per_cpu_array_maps,
             lru_per_cpu_hash_maps,
             ring_buffer_maps,
         })
     }
+}
+
+fn load_repeated_programs<T>(
+    mut object: Object,
+    repetitions: Vec<(String, usize)>,
+    load: impl FnMut(&aya_obj::Program, &aya_obj::Function) -> io::Result<T>,
+) -> io::Result<FxHashMap<String, T>> {
+    for (name, instances) in repetitions {
+        let program = object
+            .programs
+            .remove(&name)
+            .ok_or_else(|| invalid_data(format!("program {name} disappeared during loading")))?;
+        for index in 0..instances {
+            object
+                .programs
+                .insert(format!("{name}_{index}"), program.clone());
+        }
+    }
+    load_programs(object, load)
 }
 
 // The object owns instructions until every synchronous load finishes.
@@ -201,6 +307,10 @@ fn load_programs<T>(
 impl LoadedObject {
     pub fn map(&self, name: &str) -> Option<&ArrayMap> {
         self.array_maps.get(name)
+    }
+
+    pub fn hash_map(&self, name: &str) -> Option<&HashMap> {
+        self.hash_maps.get(name)
     }
 
     pub fn ring_buffer(&self, name: &str) -> Option<&RingBufferMap> {
@@ -328,6 +438,35 @@ mod tests {
         assert_eq!(ring.key_size(), 0);
         assert_eq!(ring.value_size(), 0);
         assert_eq!(ring.max_entries(), 1 << 20);
+    }
+
+    #[test]
+    fn configures_compact_mold_lanes_beyond_the_compiled_shape() {
+        let source = r#"
+typedef unsigned int u32;
+typedef unsigned long long u64;
+struct map_def { u32 type, key_size, value_size, max_entries, map_flags; };
+__attribute__((section("maps"), used))
+struct map_def slots = {2, 4, 32, 80, 1U << 10};
+__attribute__((section("maps"), used))
+struct map_def frontiers = {2, 4, 128, 8, 1U << 10};
+__attribute__((section("maps"), used))
+struct map_def cpu_to_lane = {2, 4, 4, 1, 0};
+__attribute__((section("tracepoint/test/event"), used))
+int record_generic_tracepoint(void *ctx) { return 0; }
+__attribute__((section("license"), used)) char license_value[] = "GPL";
+"#;
+        let bytes = compile("compact_lanes", source, false);
+        let mut loader = ObjectLoader::parse(&bytes).unwrap();
+        loader.configure_mold(12, 63).unwrap();
+        assert_eq!(loader.object.maps["frontiers"].max_entries(), 12);
+        assert_eq!(loader.object.maps["slots"].max_entries(), 120);
+        assert_eq!(loader.object.maps["cpu_to_lane"].max_entries(), 64);
+        let names = loader
+            .repeat_program("record_generic_tracepoint", 12)
+            .unwrap();
+        assert_eq!(names.first().unwrap(), "record_generic_tracepoint_0");
+        assert_eq!(names.last().unwrap(), "record_generic_tracepoint_11");
     }
 
     #[test]
@@ -541,13 +680,13 @@ __attribute__((section("license"), used)) char license_value[] = "GPL";
         assert!(
             matches!(ObjectLoader::parse(&socket), Err(e) if e.kind() == io::ErrorKind::Unsupported)
         );
-        let hash = compile(
-            "hash",
-            &source.replace("switches = {6,", "switches = {1,"),
+        let queue = compile(
+            "queue",
+            &source.replace("switches = {6,", "switches = {22,"),
             false,
         );
         assert!(
-            matches!(ObjectLoader::parse(&hash), Err(e) if e.kind() == io::ErrorKind::Unsupported)
+            matches!(ObjectLoader::parse(&queue), Err(e) if e.kind() == io::ErrorKind::Unsupported)
         );
         let btf = compile("btf", source, true);
         assert!(

@@ -29,6 +29,11 @@ pub struct RingBufferMap {
     obj: Map,
 }
 
+pub struct HashMap {
+    fd: OwnedFd,
+    obj: Map,
+}
+
 pub struct PerCpuArrayMap {
     fd: OwnedFd,
     obj: Map,
@@ -186,6 +191,39 @@ impl RingBufferMap {
 
     pub fn capacity(&self) -> usize {
         self.obj.max_entries() as usize
+    }
+}
+
+impl HashMap {
+    pub(crate) fn create(obj: Map) -> io::Result<Self> {
+        let fd = syscall::create_hash_map(obj.key_size(), obj.value_size(), obj.max_entries())?;
+        Ok(Self { fd, obj })
+    }
+
+    pub(crate) fn fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+
+    pub(crate) fn obj(&self) -> &Map {
+        &self.obj
+    }
+
+    pub fn write(&self, key: &[u8], value: &[u8]) -> io::Result<()> {
+        if key.len() != self.obj.key_size() as usize
+            || value.len() != self.obj.value_size() as usize
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "hash update requires exact key and value sizes",
+            ));
+        }
+        let key = u32::from_ne_bytes(key.try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "only four-byte hash keys are supported",
+            )
+        })?);
+        syscall::update_map_value(self.fd.as_fd(), key, value)
     }
 }
 

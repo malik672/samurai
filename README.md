@@ -1,426 +1,149 @@
 # Samurai
 
-Samurai uses `aya-obj` to parse compiled BPF ELF objects and relocate map
-references and BPF function calls. Map creation, program loading, perf event
-attachment, and reading map values use Samurai's own Linux syscalls; the Aya
-runtime is not a dependency.
+Samurai is an experimental Linux tracing engine built with eBPF and Mold, its
+high-throughput per-CPU event transport. It discovers tracepoint layouts from
+the running kernel, captures selected fields, follows process descendants, and
+writes versioned `.smr` recordings for offline analysis.
 
-The loader sequence is adapted from Aya's `aya/src/bpf.rs` at revision
-`15593549d93cd39decf008f6d859fd054ba40bcf`, under the MIT license retained in
-`LICENSES/aya-MIT.txt`. This is a reduced adaptation, not Aya's full loader:
-Samurai keeps its syscalls, `FxHashMap` collections, and the supported scope
-listed below. Samurai returns owned perf descriptors instead of Aya link IDs.
+Samurai can currently answer questions such as:
 
-`ObjectLoader::load()` creates maps, relocates and loads every program before
-returning. Each program borrows its function's instructions during the load
-syscall; aliases borrow the same buffer. Parsed functions are dropped at the
-end of loading. Returned program handles contain only kernel FDs, with no
-instruction copies or reference counting. A failure drops already-created
-programs and maps; retry by parsing the object again.
+- Which files did a program and its child processes open?
+- Which CPUs and processes produced the most events?
+- Which tracepoint field values occurred most frequently?
+- How many records were lost because the consumer fell behind?
 
-## Command-line interface
+Samurai is not yet a replacement for `perf` or Samply. CPU sampling, stack
+capture, symbolization, and flamegraphs are not implemented.
 
-The `samurai` binary discovers events from the running kernel, derives capture
-plans from tracefs, and embeds the generic BPF reader in the executable:
+## Requirements
+
+- Linux on a little-endian architecture
+- Rust
+- clang with the BPF backend
+- A mounted, readable tracefs
+- Permission to load and attach BPF programs
+
+## Build
 
 ```sh
 cargo build --release --bin samurai
 ```
 
-The default embedded Mold object supports eight CPUs and retains 16,384 records
-per lane. Set `SAMURAI_MOLD_LANES` and `SAMURAI_MOLD_CAPACITY` while building to
-change those dimensions; capacity must be a power of two.
+The executable embeds its generic BPF capture program.
 
-Discover, inspect, validate, and then record an event:
+## Quick start
+
+Record every `openat` performed by a command and its descendants:
 
 ```sh
-./target/release/samurai list sched
-./target/release/samurai inspect sched:sched_switch
-./target/release/samurai validate sched:sched_switch \
-  --fields prev_pid,next_pid,prev_state
-sudo ./target/release/samurai trace sched:sched_switch \
-  --fields prev_pid,next_pid,prev_state --duration 10s
 sudo ./target/release/samurai trace syscalls:sys_enter_openat \
-  --fields filename,flags,mode --count 100 --cpus 0-3 --format json
+  --fields filename,flags,mode \
+  --command 'cargo build' \
+  --output cargo-build.smr
 ```
 
-`trace` records on all online CPUs by default and stops when `--count` or
-`--duration` is reached, or on Ctrl-C. It prints up to 20 sample records after
-detaching, plus the total received and dropped counts. Delayed output avoids
-recursively recording Samurai's own writes when tracing syscall events. Use
-`--object PATH` only to override the embedded generic BPF object. `inspect` and
-`validate` read the running kernel's tracepoint format; neither attaches BPF.
-Run `samurai --help` for the full command syntax.
-
-Use `loaded.program(name)` and call its `attach()` method. There is no separate
-program `load()` call. Array-map operations live in `src/bpf/map.rs`; program
-loading and attachment live in `src/bpf/program.rs`.
-
-## Compiled tracepoint counter
-
-Requires Linux, Rust, and clang with the BPF backend. Build from this directory:
+Analyze the recording:
 
 ```sh
-mkdir -p target
-clang -target bpfel -O2 -c examples/bpf/counter.c -o target/counter.bpf.o
-cargo build --example counter
-./target/debug/examples/counter target/counter.bpf.o --check
-sudo ./target/debug/examples/counter target/counter.bpf.o 10
+./target/release/samurai analyze cargo-build.smr
 ```
 
-The last command attaches to `sched/sched_switch` for ten seconds, increments a
-CPU-local value in a per-CPU array map, and prints the summed count approximately
-once per second. Tracepoint BPF programs execute on every CPU that fires the
-event, but each CPU is the sole writer of its local counter, so no atomic
-increment is needed. The perf descriptor keeps the attachment alive and closes
-on exit.
-Tracing must be mounted and accessible. BPF/perf privileges are needed to run;
-`--check` only parses and validates the supported format without kernel access.
+The analysis includes event rate, received and dropped records, exact per-CPU
+counts, busy process IDs, and frequent captured values. It streams the file
+with memory bounded independently of recording size. High-cardinality PID and
+field rankings use fixed-capacity tables and label estimates with error bounds.
 
-Initial object support is intentionally limited to little-endian hosts and
-objects, tracepoint programs, and legacy `maps` array, per-CPU array, queue,
-and ring-buffer definitions with no flags or pinning. BTF/CO-RE, `.maps` BTF definitions,
-global data, and other program/map types are rejected. Compile the examples
-without `-g`. The `read_u64` array APIs require a u32 key and an eight-byte
-value. Per-CPU reads use caller-owned storage sized once during initialization.
-Queue values are copied into an exactly sized byte slice and removed atomically
-by the kernel.
-
-## Pollable scheduler recorder
-
-The ring-buffer example records scheduler fields for each context switch:
+## Commands
 
 ```sh
-clang -target bpfel -O2 -c examples/bpf/record.c -o target/record.bpf.o
-cargo build --example raw_record
-./target/debug/examples/raw_record target/record.bpf.o --check
-sudo ./target/debug/examples/raw_record target/record.bpf.o 10 5
+# Discover tracepoints.
+samurai list [CATEGORY]
+
+# Inspect the kernel event layout and Samurai capture policy.
+samurai inspect CATEGORY:EVENT [--fields FIELD,...]
+
+# Validate a capture plan without attaching BPF.
+samurai validate CATEGORY:EVENT [--fields FIELD,...]
+
+# Record an existing process and descendants for ten seconds.
+sudo samurai trace CATEGORY:EVENT \
+  --pid PID --fields FIELD,... --duration 10s --output capture.smr
+
+# Launch and record a command from its first instruction.
+sudo samurai trace CATEGORY:EVENT \
+  --fields FIELD,... --command 'COMMAND' --output capture.smr
+
+# Validate a completed recording and print its metadata and totals.
+samurai report capture.smr
+
+# Perform bounded offline analysis.
+samurai analyze capture.smr
 ```
 
-The BPF program reserves and fills fixed 40-byte records directly inside a
-one-MiB `BPF_MAP_TYPE_RINGBUF`. `RingBufferRecorder` memory-maps the shared
-consumer, producer, and data pages. It blocks in `poll()` when caught up, then
-decodes committed records directly from the mapping and advances the consumer
-position with release ordering. There is no syscall or intermediate copy per
-record. The optional third argument pins the single consumer to one CPU.
+Use `samurai --help` or `samurai <command> --help` for all options.
 
-A separate per-CPU array-map counter reports reservations dropped when the
-bounded ring is full. The drop counter is summed after detachment. The example
-keeps eight samples for display, drains remaining committed records, and reports
-the loss rate.
+## Capture behavior
 
-A second per-CPU map stores the last switch timestamp. The BPF program computes
-the completed timeslice on the CPU that observed it, so the userspace reducer
-does not reconstruct global event order. The final
-report ranks tasks by runtime and includes CPU percentage, switch counts,
-voluntary and involuntary switches, and average and maximum timeslice.
+Samurai loads one global BPF capture program. Each event is published once to
+the Mold lane belonging to the logical CPU on which it occurred. Different
+CPUs can produce concurrently without duplicating an event across all lanes.
 
-## Molded scheduler recorder
+`--pid PID` filters events in BPF and tracks descendants. Attaching to an
+already-running process cannot atomically snapshot its existing process tree,
+so Samurai scans `/proc` before and after attaching to narrow that race.
 
-Mold is Samurai's fixed, marked-generation transport. Every producer owns one
-preallocated lane and every lane has one assigned consumer. A producer writes a
-fixed payload between WRITING and committed generation marks; the consumer
-accepts it only when both mark reads identify the expected generation. The
-protocol has no lock, CAS retry loop, shared reservation cursor, or SeqCst
-operation. If a producer laps its consumer, `Gap(n)` reports the exact loss.
+`--command` avoids the startup race. Samurai configures tracing and starts its
+consumers before releasing the command. When invoked through `sudo`, the
+workload drops back to `SUDO_UID` and `SUDO_GID`.
 
-The public implementation is `samurai::mold`; `marked_mold` constructs an
-in-process lane, and the context-switch helpers compile the six-word schema
-into the type. The BPF prototype uses the same ownership and generation
-protocol over an mmapable array map. Its default 512K-slot lanes retained every
-record in the current controlled trials.
+Capture plans support fixed fields and explicitly configured bounded strings,
+byte buffers, `__data_loc`, and `__rel_loc` values. Inputs may be dynamic, but
+Mold records remain fixed-size and preallocated. An externally supplied BPF
+object must use the layout expected by Samurai.
+
+## Recordings and limitations
+
+The `.smr` format stores the event schema, CPU list, data frames, Mold gap
+frames, and final totals. Ordering is preserved within each CPU lane;
+cross-CPU analysis uses the captured monotonic timestamps. The format is
+documented in [docs/SMR_FORMAT.md](docs/SMR_FORMAT.md).
+
+Mold is deliberately lossy when a producer laps its consumer. Samurai records
+the detected gap instead of silently presenting the capture as complete. The
+format does not currently include a cryptographic checksum.
+
+Do not use Samurai as the only source of production audit or billing data. It
+still needs broader bare-metal validation, hostile-condition memory-ordering
+tests, and fuzzing before it should be considered production ready.
+
+The default embedded object retains 16,384 records per selected CPU and uses
+approximately 5 MiB per CPU. Set `SAMURAI_MOLD_CAPACITY` at build time to
+choose another power-of-two capacity.
+
+## Benchmarks
 
 ```sh
-clang -target bpfel -mcpu=v3 -O2 \
-  -c examples/bpf/marked_controlled.c \
-  -o target/marked_controlled.bpf.o
-cargo build --release --example marked_controlled
-sudo ./target/release/examples/marked_controlled \
-  target/marked_controlled.bpf.o 2000000 0,1,2,3 5,4,6,7
+sudo python3 benches/transport_comparison.py --scenario both --pairs 20
+sudo python3 benches/dynamic_transport_comparison.py --pairs 10 --calls 100000
 ```
 
-The fixed capacity is the retention guarantee. Userspace publishes diagnostic
-progress every 128 records, while the producer hot path remains independent of
-consumer progress. Per-lane capacity isolation and loss of global arrival order
-are explicit tradeoffs.
-
-Record layouts are declared once on the Rust side with `mold_record!`. Field
-order is the ABI that the BPF handler writes into its fixed slot:
-
-```rust
-samurai::mold_record!(ContextSwitchRecord, 6 {
-    timestamp_ns: u64,
-    runtime_ns: u64,
-    previous_pid: u32,
-    next_pid: u32,
-    cpu: u32,
-    previous_state: i64,
-});
-```
-
-`MoldProducer::produce_record` and `MoldWorker::try_next_record` encode and
-decode that type without allocation or runtime schema lookup. Supporting
-another fixed-size event requires its Rust record and schema declaration plus a
-BPF handler that writes fields in the declared order. The lane, mark, gap, and
-retention protocol remains unchanged.
-
-`openat` is the first semantic-policy example. The running kernel supplies its
-field layout, while the built-in registry validates `filename` as a pointer and
-changes its default address capture to `UserString { max_len: 128 }`:
-
-```sh
-clang -target bpfel -mcpu=v3 -O2 -I examples/bpf \
-  -c examples/bpf/generic_tracepoint.c \
-  -o target/generic-tracepoint.bpf.o
-cargo build --release --example generic_tracepoint
-sudo ./target/release/examples/generic_tracepoint \
-  target/generic-tracepoint.bpf.o \
-  syscalls sys_enter_openat dfd,filename,flags,mode 5
-```
-
-The generic reader captures up to 127 pathname bytes plus the terminator and
-reports helper errors separately from empty strings. No handwritten openat BPF
-producer or record layout remains.
-
-The built-in policy registry also understands byte buffers for `write(2)` and
-filenames for `execve(2)`. The write policy uses the syscall's `count` field as
-the authoritative length and caps capture at 128 bytes:
-
-```sh
-sudo ./target/release/examples/generic_tracepoint \
-  target/generic-tracepoint.bpf.o \
-  syscalls sys_enter_write fd,buf,count 5
-
-sudo ./target/release/examples/generic_tracepoint \
-  target/generic-tracepoint.bpf.o \
-  syscalls sys_enter_execve filename 5
-```
-
-These policies dereference pointers only because the syscall ABI identifies
-them as userspace memory. Unrecognized pointers remain numeric addresses.
-
-Inspect the running kernel's resolved layout and capture policy without loading
-or attaching BPF:
-
-```sh
-cargo build --release --example inspect_tracepoint
-sudo ./target/release/examples/inspect_tracepoint \
-  syscalls sys_enter_write fd,buf,count
-```
-
-The output includes each field's source offset, capture kind, fixed Mold width,
-operation count, byte bound, and length-field location. Omitting the field list
-inspects every event-specific field. This preflight view makes pointer
-dereferences and dynamic-location handling visible before attachment.
-
-Find relative dynamic locations provided by the running kernel:
-
-```sh
-sudo ./target/release/examples/inspect_tracepoint --find-relative
-```
-
-The command only scans tracefs format files. It prints `category:event`, field,
-and declaration for every `__rel_loc` candidate and does not load BPF.
-
-### Controlled dynamic transport benchmark
-
-Compare Aya RingBuf and Mold while both capture the same 128-byte user string
-or byte buffer from controlled syscall producers:
-
-```sh
-sudo python3 benches/dynamic_transport_comparison.py \
-  --pairs 10 --calls 100000 \
-  --producer-cpus 0,1,2,3 --consumer-cpus 5,4,6,7
-```
-
-The harness alternates run order, records perf counters and maximum RSS, checks
-complete received/drop accounting, and writes raw measurements plus system and
-compiler metadata under `target/dynamic-transport-comparison/`. The scalar
-baseline remains `benches/transport_comparison.py`, so its established fixture
-and historical results are unchanged.
-
-Both benchmark BPF objects are compiled with the same clang invocation. Aya is
-used for loading and consuming its RingBuf object, so the comparison does not
-depend on a matching Rust nightly and `bpf-linker` LLVM version.
-
-The privileged helper compatibility test adapts Aya's normal, truncation,
-empty-string, and invalid-pointer cases and verifies them through Mold:
-
-```sh
-clang -target bpfel -mcpu=v3 -O2 -I examples/bpf \
-  -DMOLD_CAPACITY=1024 \
-  -c examples/bpf/generic_tracepoint.c \
-  -o target/generic-tracepoint.bpf.o
-cargo build --release --example openat_helper_test
-sudo ./target/release/examples/openat_helper_test \
-  target/generic-tracepoint.bpf.o 0
-```
-
-The optional final argument selects the CPU for the entire test process. It
-defaults to CPU 0 and is applied before discovery, loading, attachment, and the
-four target syscalls.
-
-Aya's kernel-pointer fixture is also adapted to test the remaining pointer
-capture primitives with exact byte comparisons:
-
-```sh
-clang -target bpfel -mcpu=v3 -O2 -Wall -Wextra -Werror \
-  -c examples/bpf/pointer_helpers_test.c \
-  -o target/pointer-helpers-test.bpf.o
-cargo build --release --example pointer_helpers_test
-sudo ./target/release/examples/pointer_helpers_test \
-  target/pointer-helpers-test.bpf.o 0
-```
-
-The test uses an array-map value as a real kernel pointer and checks user bytes,
-kernel bytes, and normal, truncated, and empty kernel strings. The pathname
-offset still comes from the running kernel's tracepoint format.
-
-### Generate a tracepoint schema
-
-Samurai can turn Linux's authoritative tracepoint format into a fixed Mold BPF
-producer and matching Rust record:
-
-```sh
-cargo build --release --example generate_tracepoint
-sudo cat /sys/kernel/tracing/events/sched/sched_switch/format | \
-  ./target/release/examples/generate_tracepoint \
-    --format-file /dev/stdin sched sched_switch target/generated
-
-clang -target bpfel -mcpu=v3 -O2 -I examples/bpf \
-  -c target/generated/sched_sched_switch.bpf.c \
-  -o target/generated/sched_sched_switch.bpf.o
-```
-
-Select only the fields needed by the profiler to shrink each slot and increase
-retention within the same memory budget:
-
-```sh
-sudo cat /sys/kernel/tracing/events/sched/sched_switch/format |
-  ./target/release/examples/generate_tracepoint \
-    --format-file /dev/stdin \
-    --fields prev_pid,next_pid,prev_state \
-    sched sched_switch target/generated-minimal
-```
-
-The generator includes a timestamp and CPU, maps fixed scalars, arrays, raw
-pointers, and inline structs from their kernel-provided offsets, calculates a
-power-of-two lane capacity within a 64 MiB total transport budget, and emits
-`mold_record!` code. Raw pointers are captured only as integer addresses; the
-generic path never dereferences them. The specialized source generator still
-rejects dynamic locations because their output bound is a runtime-plan choice.
-The runtime plan uses a 64-byte default for `__data_loc` and `__rel_loc`
-fields; callers can select a different startup-time bound with
-`CapturePlan::discover_bounded`.
-
-The same validation is available without invoking a compiler. At startup,
-Samurai can discover a capture plan directly from the running kernel:
-
-```rust
-let fields = ["prev_pid", "prev_state", "next_pid"].map(str::to_owned);
-let plan = samurai::tracepoint_schema::CapturePlan::discover(
-    &samurai::utils::tracepoint::TracepointResolver::new(),
-    "sched",
-    "sched_switch",
-    Some(&fields),
-)?;
-```
-
-Each plan fixes the capture kind, source offset, byte width, signedness,
-destination Mold word, record width, and required tracepoint-context span.
-Unknown fixed-size inline declarations are preserved as bytes. Dereferencing a
-pointer remains an explicit event policy rather than something inferred from
-kernel metadata. Dynamic fields reserve one metadata word containing original
-and captured lengths followed by zero-padded data words. Ordinary locators are
-relative to the event context; relative locators are relative to the locator
-field itself. Both are clamped before the generic reader copies any bytes.
-
-Pointer policies provide four bounded primitives: `UserString`, `UserBytes`,
-`KernelString`, and `KernelBytes`. Byte policies name a length field, and
-startup validation requires that field to remain a fixed scalar in the running
-kernel schema. Unannotated pointers remain addresses. String and byte helpers
-are selected only by an explicit event policy; Samurai never guesses which
-address space a pointer belongs to.
-
-The prebuilt generic reader executes that plan without a runtime compiler. For
-example, record three fixed `sched_switch` fields from the current kernel:
-
-```sh
-clang -target bpfel -mcpu=v3 -O2 -I examples/bpf \
-  -c examples/bpf/generic_tracepoint.c \
-  -o target/generic-tracepoint.bpf.o
-cargo build --release --example generic_tracepoint
-sudo ./target/release/examples/generic_tracepoint \
-  target/generic-tracepoint.bpf.o \
-  sched sched_switch prev_pid,next_pid,prev_state 5
-```
-
-At startup, userspace lowers selected fields into at most 32 bounded copy
-operations and installs them in BPF array maps. Each operation copies one to
-eight bytes, allowing the final partial word of an inline struct. The program
-uses a fixed 34-word Mold ABI and never interprets an unannotated pointer.
-Dynamic output reports truncation when the kernel-provided length exceeds its
-configured capture bound.
-
-### Reproducible transport comparison
-
-`benches/transport_comparison.py` runs alternating paired trials against Aya,
-including warmups, `perf stat`, peak RSS, exact accounting checks, deterministic
-paired bootstrap intervals, raw output, and machine/compiler metadata.
-It reports attempted producer rate separately from loss-adjusted delivery rate.
-The end-to-end delivery rate uses records received divided by complete process
-wall time measured with a nanosecond monotonic clock, so dropped records cannot
-make a transport appear faster.
-
-Equal-memory mode compares Aya's four-MiB ring with four 16K-record Mold lanes
-(also four MiB total):
-
-```sh
-sudo python3 benches/transport_comparison.py --scenario equal --pairs 20
-```
-
-Retention mode compares Aya with Samurai's 512K-record, eight-lane production
-configuration (256 MiB total):
-
-```sh
-sudo python3 benches/transport_comparison.py --scenario retained --pairs 20
-```
-
-Use `--scenario both` to run both experiments. Results are stored below
-`target/transport-comparison/`; comparisons should only be made within one
+See [benches/DYNAMIC_TRANSPORT.md](benches/DYNAMIC_TRANSPORT.md) for the dynamic
+benchmark methodology and limitations. Compare results only within the same
 scenario and run.
 
-## Kernel aggregate profiler
-
-For cumulative scheduler statistics, Samurai can avoid the ring transport
-entirely. The BPF program reduces switches into an LRU per-CPU task map while
-the workload runs. Userspace remains asleep. After detachment, CPU partitions
-are read, processed in parallel, and merged once.
-
-```sh
-clang -target bpfel -O2 -c examples/bpf/aggregate.c -o target/aggregate.bpf.o
-cargo build --release --example record
-sudo ./target/release/examples/record target/aggregate.bpf.o 10
-```
-
-The report compares the CPU-local record counter with records retained in the
-task map. A nonzero eviction count means the configured 16,384-task LRU capacity
-was insufficient for the recording.
-
-Handwritten instructions and `examples/load.rs` remain small syscall fixtures.
-The independent Aya comparison harness in `benches/aya_attach` has its own
-build script and is excluded from Cargo's automatic benchmark discovery.
-
-## Checks
+## Tests
 
 ```sh
 cargo test --all-targets
 ```
 
-Object-loader tests compile the C fixture using clang, then exercise parsing,
-unsupported-input rejection, and relocations without requiring root.
+Some live BPF tests and benchmarks require Linux privileges.
 
 ## License
 
-Samurai is licensed under the [MIT License](LICENSE). Code adapted from Aya
-retains its original notice in [LICENSES/aya-MIT.txt](LICENSES/aya-MIT.txt).
+Samurai uses `aya-obj` for ELF parsing and relocations, but its own Linux
+syscall layer for loading and attachment. Its reduced loader was adapted from
+Aya under the retained MIT notice in
+[LICENSES/aya-MIT.txt](LICENSES/aya-MIT.txt).
+
+Samurai is licensed under the [MIT License](LICENSE).

@@ -4,9 +4,12 @@
 #ifndef CAPACITY
 #define CAPACITY 524288
 #endif
+#ifndef PAYLOAD_BYTES
+#define PAYLOAD_BYTES 128
+#endif
 #define MOLD_LANES LANES
 #define MOLD_CAPACITY CAPACITY
-#define MOLD_WORDS 19
+#define MOLD_WORDS (3 + ((PAYLOAD_BYTES + 7) / 8))
 #include "mold.h"
 
 struct config { u32 pid, pointer_offset, length_offset, mode, enabled; };
@@ -30,16 +33,17 @@ static __attribute__((always_inline)) int emit(void *ctx, u32 expected_mode,
         cfg->pid != (u32)(pid_tgid >> 32) ||
         cfg->mode != expected_mode)
         return 0;
-    u64 pointer = 0, length = 128;
+    u64 pointer = 0, length = PAYLOAD_BYTES;
     if (probe_read_kernel(&pointer, 8, (char *)ctx + cfg->pointer_offset) < 0)
         return 0;
     if (expected_mode == 2 &&
         probe_read_kernel(&length, 8, (char *)ctx + cfg->length_offset) < 0)
         return 0;
     u64 words[MOLD_WORDS] = {ktime_get_ns(), length};
+    if (length > PAYLOAD_BYTES) length = PAYLOAD_BYTES;
     long result = expected_mode == 1
-        ? probe_read_user_str(&words[3], 128, (void *)pointer)
-        : probe_read_user(&words[3], 128, (void *)pointer);
+        ? probe_read_user_str(&words[3], PAYLOAD_BYTES, (void *)pointer)
+        : probe_read_user(&words[3], (u32)length, (void *)pointer);
     words[2] = (u64)result;
     mold_publish(cpu, words);
     return 0;

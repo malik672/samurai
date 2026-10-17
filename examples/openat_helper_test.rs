@@ -50,7 +50,9 @@ fn main() -> io::Result<()> {
     let filename_word = filename.destination_word;
     let operations = plan.operations()?;
 
-    let loaded = ObjectLoader::from_file(object)?.load()?;
+    let mut loader = ObjectLoader::from_file(object)?;
+    loader.configure_mold(1, cpu)?;
+    let loaded = loader.load()?;
     loaded
         .map("capture_config")
         .ok_or_else(|| missing("capture_config"))?
@@ -61,6 +63,12 @@ fn main() -> io::Result<()> {
     for (index, operation) in operations.iter().enumerate() {
         operation_map.write(index as u32, &operation.to_bytes())?;
     }
+    let cpu_key = u32::try_from(cpu)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "CPU number is too large"))?;
+    loaded
+        .map("cpu_to_lane")
+        .ok_or_else(|| missing("cpu_to_lane"))?
+        .write(cpu_key, &1u32.to_ne_bytes())?;
     let wanted_pid = std::process::id();
     let slots = loaded
         .map("slots")
@@ -77,7 +85,7 @@ fn main() -> io::Result<()> {
     let program = loaded
         .program("record_generic_tracepoint")
         .ok_or_else(|| missing("record_generic_tracepoint"))?;
-    let attachment = program.attach(&resolver, "syscalls", "sys_enter_openat")?;
+    let attachment = program.attach_to_cpu(&resolver, "syscalls", "sys_enter_openat", cpu)?;
 
     call_openat(CString::new("/dev/null").unwrap().as_ptr());
     let long = CString::new(vec![b'a'; 128]).unwrap();

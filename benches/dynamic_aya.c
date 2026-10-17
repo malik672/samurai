@@ -1,8 +1,11 @@
 typedef unsigned int u32;
 typedef unsigned long long u64;
+#ifndef PAYLOAD_BYTES
+#define PAYLOAD_BYTES 128
+#endif
 struct map_def { u32 type, key_size, value_size, max_entries, map_flags; };
 struct config { u32 pid, pointer_offset, length_offset, mode, enabled; };
-struct event { u64 timestamp_ns; long result; unsigned char payload[128]; };
+struct event { u64 timestamp_ns; long result; unsigned char payload[PAYLOAD_BYTES]; };
 
 __attribute__((section("maps"), used))
 struct map_def DYNAMIC = {27, 0, 0, 4 * 1024 * 1024, 0};
