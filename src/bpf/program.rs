@@ -21,7 +21,7 @@ impl TracePoint {
         )?;
         Ok(Self { fd })
     }
-    /// Keep the returned FD alive to retain this CPU's attachment.
+    /// Keep the returned FD alive to retain the global tracepoint attachment.
     pub fn attach(
         &self,
         resolver: &TracepointResolver,

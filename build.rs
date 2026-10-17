@@ -4,21 +4,12 @@ fn main() {
     println!("cargo:rerun-if-changed=examples/bpf/generic_tracepoint.c");
     println!("cargo:rerun-if-changed=examples/bpf/mold.h");
     println!("cargo:rerun-if-env-changed=CLANG");
-    println!("cargo:rerun-if-env-changed=SAMURAI_MOLD_LANES");
     println!("cargo:rerun-if-env-changed=SAMURAI_MOLD_CAPACITY");
 
-    let lanes = env::var("SAMURAI_MOLD_LANES").unwrap_or_else(|_| "8".to_owned());
     let capacity = env::var("SAMURAI_MOLD_CAPACITY").unwrap_or_else(|_| "16384".to_owned());
-    let lanes_value = lanes
-        .parse::<usize>()
-        .expect("SAMURAI_MOLD_LANES must be a positive integer");
     let capacity_value = capacity
         .parse::<usize>()
         .expect("SAMURAI_MOLD_CAPACITY must be a positive integer");
-    assert!(
-        lanes_value > 0,
-        "SAMURAI_MOLD_LANES must be greater than zero"
-    );
     assert!(
         capacity_value.is_power_of_two(),
         "SAMURAI_MOLD_CAPACITY must be a power of two"
@@ -35,7 +26,7 @@ fn main() {
             "-O2",
             "-I",
             "examples/bpf",
-            &format!("-DMOLD_LANES={lanes_value}"),
+            "-DMOLD_LANES=1",
             &format!("-DMOLD_CAPACITY={capacity_value}"),
             "-c",
             "examples/bpf/generic_tracepoint.c",

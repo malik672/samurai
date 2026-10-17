@@ -2,10 +2,10 @@ use std::{io, path::Path, time::Duration};
 
 fn main() -> io::Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    let [object, category, event, fields, seconds] = args.as_slice() else {
+    let [object, category, event, fields, seconds, output] = args.as_slice() else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: generic_tracepoint <bpf-object> <category> <event> <field,...> <seconds>",
+            "usage: generic_tracepoint <bpf-object> <category> <event> <field,...> <seconds> <output.smr>",
         ));
     };
     let seconds = seconds
@@ -18,8 +18,10 @@ fn main() -> io::Result<()> {
         Some(&selected),
         None,
         None,
+        None,
+        None,
         Some(Duration::from_secs(seconds)),
-        false,
+        Path::new(output),
         Some(Path::new(object)),
     )
 }

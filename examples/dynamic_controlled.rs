@@ -23,13 +23,6 @@ use std::{
 const CONSUMER_MARK_INTERVAL: u64 = 128;
 
 #[repr(C)]
-struct Slot {
-    mark: AtomicU64,
-    kind: u64,
-    words: [u64; 19],
-}
-
-#[repr(C)]
 struct Frontier {
     producer_mark: AtomicU64,
     producer_padding: [u64; 7],
@@ -70,12 +63,17 @@ fn main() -> io::Result<()> {
         }
     };
     let calls: u64 = args[2].parse().map_err(invalid)?;
+    let measure_latency = std::env::var_os("BENCH_LATENCY").is_some();
+    let pause_every = env_u64("BENCH_PAUSE_EVERY")?;
+    let pause_us = env_u64("BENCH_PAUSE_US")?;
     let producer_cpus = parse_cpu_list(&args[3])?;
     let consumer_cpus = parse_cpu_list(&args[4])?;
-    if producer_cpus.is_empty() || consumer_cpus.len() < producer_cpus.len() {
+    if producer_cpus.is_empty()
+        || (consumer_cpus.len() != 1 && consumer_cpus.len() < producer_cpus.len())
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "each producer CPU needs a consumer CPU",
+            "use one shared consumer CPU or one consumer CPU per producer",
         ));
     }
 
@@ -106,7 +104,7 @@ fn main() -> io::Result<()> {
     config.write(0, &config_value)?;
     let slots = slots.mmap()?;
     let frontiers = frontiers.mmap()?;
-    if slots.value_size() != size_of::<Slot>() || frontiers.value_size() != 128 {
+    if slots.value_size() < 3 * size_of::<u64>() || frontiers.value_size() != 128 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unexpected dynamic Mold ABI",
@@ -152,22 +150,59 @@ fn main() -> io::Result<()> {
     let mut results = Vec::new();
     let mut producer_seconds = 0.0;
     thread::scope(|scope| -> io::Result<()> {
-        let consumers: Vec<_> = producer_cpus
-            .iter()
-            .copied()
-            .zip(consumer_cpus.iter().copied())
-            .map(|(lane_cpu, worker_cpu)| {
-                let slots = &slots;
-                let frontiers = &frontiers;
-                let stop = &stop;
-                let start = &start;
-                scope.spawn(move || {
-                    consume_lane(
-                        slots, frontiers, capacity, lane_cpu, worker_cpu, stop, start,
-                    )
-                })
+        let shared_consumer = (consumer_cpus.len() == 1).then(|| {
+            let lane_cpus = &producer_cpus;
+            let worker_cpu = consumer_cpus[0];
+            let slots = &slots;
+            let frontiers = &frontiers;
+            let stop = &stop;
+            let start = &start;
+            scope.spawn(move || {
+                consume_lanes(
+                    slots,
+                    frontiers,
+                    capacity,
+                    lane_cpus,
+                    worker_cpu,
+                    stop,
+                    start,
+                    measure_latency,
+                    pause_every,
+                    pause_us,
+                    calls,
+                )
             })
-            .collect();
+        });
+        let consumers: Vec<_> = if shared_consumer.is_none() {
+            producer_cpus
+                .iter()
+                .copied()
+                .zip(consumer_cpus.iter().copied())
+                .map(|(lane_cpu, worker_cpu)| {
+                    let slots = &slots;
+                    let frontiers = &frontiers;
+                    let stop = &stop;
+                    let start = &start;
+                    scope.spawn(move || {
+                        consume_lane(
+                            slots,
+                            frontiers,
+                            capacity,
+                            lane_cpu,
+                            worker_cpu,
+                            stop,
+                            start,
+                            measure_latency,
+                            pause_every,
+                            pause_us,
+                            calls,
+                        )
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let producers: Vec<_> = producer_cpus
             .iter()
             .copied()
@@ -221,6 +256,13 @@ fn main() -> io::Result<()> {
         config_value[16..20].copy_from_slice(&0u32.to_ne_bytes());
         config.write(0, &config_value)?;
         stop.store(true, Ordering::Release);
+        if let Some(consumer) = shared_consumer {
+            results.extend(
+                consumer
+                    .join()
+                    .map_err(|_| io::Error::other("consumer panicked"))??,
+            );
+        }
         for consumer in consumers {
             results.push(
                 consumer
@@ -242,29 +284,180 @@ fn main() -> io::Result<()> {
         .iter()
         .max_by_key(|result| result.max_checkpoint_offcpu_ns)
         .expect("at least one consumer");
+    let worst_values = (
+        worst.lane_cpu,
+        worst.worker_cpu,
+        worst.involuntary,
+        worst.wall_ns,
+        worst.cpu_ns,
+    );
+    let worst_pause_values = (
+        worst_pause.max_checkpoint_offcpu_ns,
+        worst_pause.lane_cpu,
+        worst_pause.worker_cpu,
+    );
     let checksum: u64 = results
         .iter()
         .map(|r| r.checksum)
         .fold(0, u64::wrapping_add);
+    let mut latencies: Vec<_> = results
+        .iter_mut()
+        .flat_map(|result| std::mem::take(&mut result.latencies))
+        .collect();
+    latencies.sort_unstable();
+    let (latency_p50_ns, latency_p95_ns, latency_p99_ns, latency_max_ns) =
+        latency_summary(&latencies);
     let requested = calls * producer_cpus.len() as u64;
     println!(
-        "mode=mold shape={mode} attachment=per_cpu_gated_v4 producers={} calls_per_producer={calls} requested={requested} received={received} dropped={gaps} unaccounted={} loss_pct={:.4} producer_seconds={producer_seconds:.6} requested_per_second={:.0} consumer_cpu_ms={:.3} lanes={lanes} capacity={capacity} map_bytes={} max_backlog={max_backlog} worst_lane={} worst_worker={} worst_involuntary={} worst_wall_ms={:.3} worst_cpu_ms={:.3} max_checkpoint_offcpu_ms={:.3} pause_lane={} pause_worker={} consumer_mark_interval={CONSUMER_MARK_INTERVAL} checksum={checksum}",
+        "mode=mold shape={mode} attachment=per_cpu_gated_v4 producers={} calls_per_producer={calls} requested={requested} received={received} dropped={gaps} unaccounted={} loss_pct={:.4} producer_seconds={producer_seconds:.6} requested_per_second={:.0} consumer_cpu_ms={:.3} lanes={lanes} capacity={capacity} map_bytes={} max_backlog={max_backlog} worst_lane={} worst_worker={} worst_involuntary={} worst_wall_ms={:.3} worst_cpu_ms={:.3} max_checkpoint_offcpu_ms={:.3} pause_lane={} pause_worker={} consumer_mark_interval={CONSUMER_MARK_INTERVAL} latency_samples={} latency_p50_ns={latency_p50_ns} latency_p95_ns={latency_p95_ns} latency_p99_ns={latency_p99_ns} latency_max_ns={latency_max_ns} checksum={checksum}",
         producer_cpus.len(),
         requested.abs_diff(received + gaps),
         gaps as f64 * 100.0 / requested.max(1) as f64,
         requested as f64 / producer_seconds,
         cpu_ns as f64 / 1_000_000.0,
         slots.entries() * slots.value_size(),
-        worst.lane_cpu,
-        worst.worker_cpu,
-        worst.involuntary,
-        worst.wall_ns as f64 / 1_000_000.0,
-        worst.cpu_ns as f64 / 1_000_000.0,
-        worst_pause.max_checkpoint_offcpu_ns as f64 / 1_000_000.0,
-        worst_pause.lane_cpu,
-        worst_pause.worker_cpu,
+        worst_values.0,
+        worst_values.1,
+        worst_values.2,
+        worst_values.3 as f64 / 1_000_000.0,
+        worst_values.4 as f64 / 1_000_000.0,
+        worst_pause_values.0 as f64 / 1_000_000.0,
+        worst_pause_values.1,
+        worst_pause_values.2,
+        latencies.len(),
     );
     Ok(())
+}
+
+struct LaneCursor {
+    lane_cpu: usize,
+    expected: u64,
+    received: u64,
+    gaps: u64,
+    checksum: u64,
+    max_backlog: u64,
+    latencies: Vec<u64>,
+}
+
+fn consume_lanes(
+    slots: &MappedArray<'_>,
+    frontiers: &MappedArray<'_>,
+    capacity: usize,
+    lane_cpus: &[usize],
+    worker_cpu: usize,
+    stop: &AtomicBool,
+    start: &Barrier,
+    measure_latency: bool,
+    pause_every: u64,
+    pause_us: u64,
+    calls_per_lane: u64,
+) -> io::Result<Vec<Result>> {
+    pin_current_thread(worker_cpu)?;
+    let latency_capacity = if measure_latency {
+        usize::try_from(calls_per_lane)
+            .map_err(|_| io::Error::other("latency sample count is too large"))?
+    } else {
+        0
+    };
+    let mut cursors: Vec<_> = lane_cpus
+        .iter()
+        .copied()
+        .map(|lane_cpu| LaneCursor {
+            lane_cpu,
+            expected: 1,
+            received: 0,
+            gaps: 0,
+            checksum: 0,
+            max_backlog: 0,
+            latencies: Vec::with_capacity(latency_capacity),
+        })
+        .collect();
+    start.wait();
+    let wall_start = Instant::now();
+    let cpu_start = thread_cpu_ns();
+    let usage_start = thread_usage();
+    let mut total_received = 0u64;
+    loop {
+        let mut caught_up = true;
+        for cursor in &mut cursors {
+            let frontier = frontiers.value_ptr(cursor.lane_cpu)?.cast::<Frontier>();
+            let frontier = unsafe { frontier.as_ref() };
+            let published = frontier.producer_mark.load(Ordering::Acquire);
+            if cursor.expected <= published {
+                caught_up = false;
+                cursor.max_backlog = cursor.max_backlog.max(published - (cursor.expected - 1));
+                let oldest = published.saturating_sub(capacity as u64 - 1).max(1);
+                if cursor.expected < oldest {
+                    cursor.gaps += oldest - cursor.expected;
+                    cursor.expected = oldest;
+                    frontier
+                        .consumer_mark
+                        .store(cursor.expected - 1, Ordering::Release);
+                }
+                let index = cursor.lane_cpu * capacity
+                    + ((cursor.expected - 1) & (capacity as u64 - 1)) as usize;
+                let slot = slots.value_ptr(index)?.cast::<u8>();
+                let mark = unsafe { slot.cast::<AtomicU64>().as_ref() };
+                let first = mark.load(Ordering::Acquire);
+                if first == cursor.expected {
+                    let timestamp =
+                        unsafe { std::ptr::read_volatile(slot.add(16).cast::<u64>().as_ptr()) };
+                    fence(Ordering::Acquire);
+                    if mark.load(Ordering::Acquire) == first {
+                        cursor.checksum = cursor.checksum.wrapping_add(timestamp);
+                        if measure_latency {
+                            cursor
+                                .latencies
+                                .push(monotonic_ns().saturating_sub(timestamp));
+                        }
+                        cursor.received += 1;
+                        total_received += 1;
+                        cursor.expected += 1;
+                        maybe_pause(total_received, pause_every, pause_us);
+                        if cursor.received % CONSUMER_MARK_INTERVAL == 0 {
+                            frontier
+                                .consumer_mark
+                                .store(cursor.expected - 1, Ordering::Release);
+                        }
+                    }
+                }
+            }
+        }
+        if stop.load(Ordering::Acquire) && caught_up {
+            break;
+        }
+        std::hint::spin_loop();
+    }
+    let usage_end = thread_usage();
+    let wall_ns = wall_start.elapsed().as_nanos() as u64;
+    let cpu_ns = thread_cpu_ns() - cpu_start;
+    let involuntary = usage_end.ru_nivcsw - usage_start.ru_nivcsw;
+    let mut results = Vec::with_capacity(cursors.len());
+    for (index, cursor) in cursors.into_iter().enumerate() {
+        let frontier = unsafe {
+            frontiers
+                .value_ptr(cursor.lane_cpu)?
+                .cast::<Frontier>()
+                .as_ref()
+        };
+        frontier
+            .consumer_mark
+            .store(cursor.expected - 1, Ordering::Release);
+        results.push(Result {
+            received: cursor.received,
+            gaps: cursor.gaps,
+            cpu_ns: if index == 0 { cpu_ns } else { 0 },
+            checksum: cursor.checksum,
+            max_backlog: cursor.max_backlog,
+            lane_cpu: cursor.lane_cpu,
+            worker_cpu,
+            involuntary: if index == 0 { involuntary } else { 0 },
+            wall_ns,
+            max_checkpoint_offcpu_ns: 0,
+            latencies: cursor.latencies,
+        });
+    }
+    Ok(results)
 }
 
 struct Result {
@@ -278,6 +471,7 @@ struct Result {
     involuntary: i64,
     wall_ns: u64,
     max_checkpoint_offcpu_ns: u64,
+    latencies: Vec<u64>,
 }
 
 fn consume_lane(
@@ -288,12 +482,21 @@ fn consume_lane(
     worker_cpu: usize,
     stop: &AtomicBool,
     start: &Barrier,
+    measure_latency: bool,
+    pause_every: u64,
+    pause_us: u64,
+    calls: u64,
 ) -> io::Result<Result> {
     pin_current_thread(worker_cpu)?;
     let frontier = frontiers.value_ptr(lane_cpu)?.cast::<Frontier>();
     let frontier = unsafe { frontier.as_ref() };
     let mut expected = 1u64;
     let (mut received, mut gaps, mut checksum) = (0u64, 0u64, 0u64);
+    let mut latencies = Vec::with_capacity(if measure_latency {
+        usize::try_from(calls).map_err(|_| io::Error::other("latency sample count is too large"))?
+    } else {
+        0
+    });
     let mut max_backlog = 0u64;
     start.wait();
     let wall_start = Instant::now();
@@ -315,16 +518,21 @@ fn consume_lane(
                     .store(expected - 1, Ordering::Release);
             }
             let index = lane_cpu * capacity + ((expected - 1) & (capacity as u64 - 1)) as usize;
-            let slot = slots.value_ptr(index)?.cast::<Slot>();
-            let slot = unsafe { slot.as_ref() };
-            let first = slot.mark.load(Ordering::Acquire);
+            let slot = slots.value_ptr(index)?.cast::<u8>();
+            let mark = unsafe { slot.cast::<AtomicU64>().as_ref() };
+            let first = mark.load(Ordering::Acquire);
             if first == expected {
-                let words = unsafe { std::ptr::read_volatile(&raw const slot.words) };
+                let timestamp =
+                    unsafe { std::ptr::read_volatile(slot.add(16).cast::<u64>().as_ptr()) };
                 fence(Ordering::Acquire);
-                if slot.mark.load(Ordering::Acquire) == first {
-                    checksum = checksum.wrapping_add(words[0]);
+                if mark.load(Ordering::Acquire) == first {
+                    checksum = checksum.wrapping_add(timestamp);
+                    if measure_latency {
+                        latencies.push(monotonic_ns().saturating_sub(timestamp));
+                    }
                     received += 1;
                     expected += 1;
+                    maybe_pause(received, pause_every, pause_us);
                     if received % CONSUMER_MARK_INTERVAL == 0 {
                         frontier
                             .consumer_mark
@@ -368,7 +576,48 @@ fn consume_lane(
         involuntary: usage_end.ru_nivcsw - usage_start.ru_nivcsw,
         wall_ns,
         max_checkpoint_offcpu_ns,
+        latencies,
     })
+}
+
+fn monotonic_ns() -> u64 {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut time);
+    }
+    time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64
+}
+
+fn latency_summary(values: &[u64]) -> (u64, u64, u64, u64) {
+    let percentile = |numerator: usize| {
+        values
+            .get(values.len().saturating_sub(1) * numerator / 100)
+            .copied()
+            .unwrap_or(0)
+    };
+    (
+        percentile(50),
+        percentile(95),
+        percentile(99),
+        values.last().copied().unwrap_or(0),
+    )
+}
+
+fn env_u64(name: &str) -> io::Result<u64> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.parse().map_err(invalid))
+        .transpose()
+        .map(|value| value.unwrap_or(0))
+}
+
+fn maybe_pause(received: u64, every: u64, pause_us: u64) {
+    if every != 0 && pause_us != 0 && received % every == 0 {
+        thread::sleep(std::time::Duration::from_micros(pause_us));
+    }
 }
 
 fn thread_usage() -> libc::rusage {

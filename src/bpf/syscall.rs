@@ -16,6 +16,7 @@ pub const BPF_MAP_CREATE: u32 = 0;
 const BPF_MAP_LOOKUP_ELEM: u32 = 1;
 const BPF_MAP_UPDATE_ELEM: u32 = 2;
 const BPF_MAP_GET_NEXT_KEY: u32 = 4;
+pub const BPF_MAP_TYPE_HASH: u32 = 1;
 pub const BPF_MAP_TYPE_ARRAY: u32 = 2;
 pub const BPF_MAP_TYPE_PERCPU_ARRAY: u32 = 6;
 pub const BPF_MAP_TYPE_LRU_PERCPU_HASH: u32 = 10;
@@ -341,6 +342,10 @@ fn create_map(
 
 pub fn create_array_map(key_size: u32, value_size: u32, max_entries: u32) -> io::Result<OwnedFd> {
     create_array_map_with_flags(key_size, value_size, max_entries, 0)
+}
+
+pub fn create_hash_map(key_size: u32, value_size: u32, max_entries: u32) -> io::Result<OwnedFd> {
+    create_map(BPF_MAP_TYPE_HASH, key_size, value_size, max_entries, 0)
 }
 
 pub(crate) fn create_array_map_with_flags(

@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use std::{path::PathBuf, process::ExitCode, time::Duration};
 
 #[derive(Parser)]
@@ -36,6 +36,16 @@ enum Command {
         #[arg(long)]
         fields: Option<String>,
     },
+    /// Validate and summarize a completed .smr recording.
+    Report {
+        /// Recording produced by `samurai trace --output`.
+        recording: PathBuf,
+    },
+    /// Stream a completed .smr recording and rank its busiest CPUs, PIDs, and field values.
+    Analyze {
+        /// Recording produced by `samurai trace --output`.
+        recording: PathBuf,
+    },
     /// Record a tracepoint using its discovered capture plan.
     Trace {
         /// Event in category:event form.
@@ -46,26 +56,25 @@ enum Command {
         /// CPUs to attach on, for example `0-3,5`; defaults to all online CPUs.
         #[arg(long)]
         cpus: Option<String>,
+        /// Record this process and all descendants it creates.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        pid: Option<u32>,
+        /// Launch this shell command after tracing is fully ready.
+        #[arg(long, value_name = "SHELL_COMMAND", conflicts_with_all = ["pid", "count", "duration"])]
+        command: Option<String>,
         /// Stop after receiving this many records.
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         count: Option<u64>,
         /// Stop after this duration, for example `10s` or `2m`.
         #[arg(long, value_parser = parse_duration)]
         duration: Option<Duration>,
-        /// Output records as text or JSON lines.
-        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
-        format: OutputFormat,
+        /// Binary .smr recording to create.
+        #[arg(long)]
+        output: PathBuf,
         /// Override the embedded generic BPF object.
         #[arg(long)]
         object: Option<PathBuf>,
     },
-}
-
-#[derive(Clone, Copy, Debug, Default, ValueEnum)]
-enum OutputFormat {
-    #[default]
-    Text,
-    Json,
 }
 
 fn main() -> ExitCode {
@@ -86,13 +95,54 @@ fn main() -> ExitCode {
                 .transpose()?;
             samurai::cli::run_validate(&category, &event, fields.as_deref())
         }),
+        Command::Report { recording } => samurai::smr::inspect(&recording).map(|summary| {
+            println!("recording={}", recording.display());
+            println!("event={}:{}", summary.category, summary.event);
+            println!("cpus={:?}", summary.cpus);
+            println!("fields={}", summary.fields.join(","));
+            println!("words={}", summary.words);
+            println!("received={}", summary.received);
+            println!("dropped={}", summary.dropped);
+            println!("bytes={}", summary.bytes);
+        }),
+        Command::Analyze { recording } => samurai::smr::analyze(&recording).map(|analysis| {
+            println!("recording={}", recording.display());
+            println!(
+                "event={}:{}",
+                analysis.summary.category, analysis.summary.event
+            );
+            println!("received={}", analysis.summary.received);
+            println!("dropped={}", analysis.summary.dropped);
+            if let (Some(first), Some(last)) =
+                (analysis.first_timestamp_ns, analysis.last_timestamp_ns)
+            {
+                let duration_ns = last.saturating_sub(first);
+                println!("event_span_ns={duration_ns}");
+                if duration_ns != 0 {
+                    let rate =
+                        analysis.summary.received as f64 * 1_000_000_000.0 / duration_ns as f64;
+                    println!("event_rate_per_second={rate:.2}");
+                }
+            }
+            println!("file_order_timestamp_regressions={}", analysis.out_of_order);
+            println!("cpu_counts:");
+            for (cpu, count) in analysis.cpu_counts {
+                println!("  {cpu}: {count}");
+            }
+            print_ranked("pid_counts", &analysis.pid_counts);
+            for field in analysis.fields {
+                print_ranked(&format!("field.{}", field.name), &field.values);
+            }
+        }),
         Command::Trace {
             event,
             fields,
             cpus,
+            pid,
+            command,
             count,
             duration,
-            format,
+            output,
             object,
         } => split_event(&event).and_then(|(category, event)| {
             let fields = fields
@@ -104,9 +154,11 @@ fn main() -> ExitCode {
                 &event,
                 fields.as_deref(),
                 cpus.as_deref(),
+                pid,
+                command.as_deref(),
                 count,
                 duration,
-                matches!(format, OutputFormat::Json),
+                &output,
                 object.as_deref(),
             )
         }),
@@ -117,6 +169,20 @@ fn main() -> ExitCode {
         Err(error) => {
             eprintln!("samurai: {error}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+fn print_ranked(name: &str, values: &[samurai::smr::RankedCount]) {
+    println!("{name}:");
+    for value in values {
+        if value.error == 0 {
+            println!("  {:?}: {}", value.value, value.count);
+        } else {
+            println!(
+                "  {:?}: <= {} (bounded estimate, error <= {})",
+                value.value, value.count, value.error
+            );
         }
     }
 }

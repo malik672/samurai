@@ -1,6 +1,8 @@
 //! Molded streaming with generation marks.
 use crate::bpf::map::MappedArray;
 use std::io;
+use std::marker::PhantomData;
+use std::ptr::NonNull;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -40,7 +42,7 @@ pub struct MoldWorker<const WORDS: usize> {
     done: bool,
 }
 
-#[repr(C)]
+#[repr(C, align(64))]
 struct MappedSlot<const WORDS: usize> {
     mark: AtomicU64,
     kind: u64,
@@ -65,11 +67,19 @@ pub struct MappedMold<'map, const WORDS: usize> {
 
 /// One userspace cursor over one CPU-owned BPF lane.
 pub struct MappedMoldWorker<'mold, 'map, const WORDS: usize> {
-    mold: &'mold MappedMold<'map, WORDS>,
+    slots: NonNull<MappedSlot<WORDS>>,
+    frontier: NonNull<MappedFrontier>,
+    mask: u64,
     lane: usize,
     expected_mark: u64,
     consumed_since_publish: u64,
+    _mapping: PhantomData<&'mold MappedMold<'map, WORDS>>,
 }
+
+// Each worker owns one consumer cursor. The pointed-to maps outlive the scoped
+// worker threads, and the BPF producer is the only writer of slot/frontier
+// producer state for this lane.
+unsafe impl<const WORDS: usize> Send for MappedMoldWorker<'_, '_, WORDS> {}
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum MoldEntry<const WORDS: usize> {
@@ -280,24 +290,35 @@ impl<'map, const WORDS: usize> MappedMold<'map, WORDS> {
                 "Mold lane index out of range",
             ));
         }
+        let slots = self
+            .slots
+            .value_ptr(lane * self.capacity)?
+            .cast::<MappedSlot<WORDS>>();
+        let frontier = self.frontiers.value_ptr(lane)?.cast::<MappedFrontier>();
         Ok(MappedMoldWorker {
-            mold: self,
+            slots,
+            frontier,
+            mask: self.capacity as u64 - 1,
             lane,
             expected_mark: 1,
             consumed_since_publish: 0,
+            _mapping: PhantomData,
         })
     }
 }
 
 impl<const WORDS: usize> MappedMoldWorker<'_, '_, WORDS> {
+    pub fn lane(&self) -> usize {
+        self.lane
+    }
+
     pub fn try_next(&mut self) -> io::Result<Option<MoldEntry<WORDS>>> {
-        let producer_mark = self.frontier()?.producer_mark.load(Ordering::Acquire);
+        let frontier = unsafe { self.frontier.as_ref() };
+        let producer_mark = frontier.producer_mark.load(Ordering::Acquire);
         if self.expected_mark > producer_mark {
             return Ok(None);
         }
-        let oldest_mark = producer_mark
-            .saturating_sub(self.mold.capacity as u64 - 1)
-            .max(1);
+        let oldest_mark = producer_mark.saturating_sub(self.mask).max(1);
         if self.expected_mark < oldest_mark {
             let missed = oldest_mark - self.expected_mark;
             self.expected_mark = oldest_mark;
@@ -305,14 +326,8 @@ impl<const WORDS: usize> MappedMoldWorker<'_, '_, WORDS> {
             return Ok(Some(MoldEntry::Gap(missed)));
         }
 
-        let index = self.lane * self.mold.capacity
-            + ((self.expected_mark - 1) & (self.mold.capacity as u64 - 1)) as usize;
-        let slot = self
-            .mold
-            .slots
-            .value_ptr(index)?
-            .cast::<MappedSlot<WORDS>>();
-        let slot = unsafe { slot.as_ref() };
+        let index = ((self.expected_mark - 1) & self.mask) as usize;
+        let slot = unsafe { self.slots.add(index).as_ref() };
         let first_mark = slot.mark.load(Ordering::Acquire);
         if first_mark != self.expected_mark {
             return Ok(None);
@@ -350,26 +365,20 @@ impl<const WORDS: usize> MappedMoldWorker<'_, '_, WORDS> {
     }
 
     pub fn is_caught_up(&self) -> io::Result<bool> {
-        Ok(self.expected_mark > self.frontier()?.producer_mark.load(Ordering::Acquire))
+        Ok(self.expected_mark
+            > unsafe { self.frontier.as_ref() }
+                .producer_mark
+                .load(Ordering::Acquire))
     }
 
     pub fn publish_consumer_mark(&mut self) -> io::Result<()> {
         self.publish_progress()
     }
 
-    fn frontier(&self) -> io::Result<&MappedFrontier> {
-        let frontier = self
-            .mold
-            .frontiers
-            .value_ptr(self.lane)?
-            .cast::<MappedFrontier>();
-        Ok(unsafe { frontier.as_ref() })
-    }
-
     fn publish_progress(&mut self) -> io::Result<()> {
         let consumer_mark = self.expected_mark - 1;
         self.consumed_since_publish = 0;
-        self.frontier()?
+        unsafe { self.frontier.as_ref() }
             .consumer_mark
             .store(consumer_mark, Ordering::Release);
         Ok(())

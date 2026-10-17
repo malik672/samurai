@@ -8,7 +8,7 @@ use aya::{
     maps::{Array, PerCpuArray, RingBuf},
     programs::TracePoint,
 };
-use integration_common::mold_bench::{DynamicConfig, DynamicEvent};
+use integration_common::mold_bench::DynamicConfig;
 use std::{
     error::Error,
     ffi::CString,
@@ -35,6 +35,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         _ => return Err("mode must be string or bytes".into()),
     };
     let calls: u64 = args[2].parse()?;
+    let measure_latency = std::env::var_os("BENCH_LATENCY").is_some();
+    let pause_every = env_u64("BENCH_PAUSE_EVERY")?;
+    let pause_us = env_u64("BENCH_PAUSE_US")?;
     let cpus = parse_cpus(&args[3])?;
     let producer_count = cpus.len();
     let consumer_cpu: usize = args[4].parse()?;
@@ -95,10 +98,26 @@ fn main() -> Result<(), Box<dyn Error>> {
     config.set(0, &config_value, 0)?;
     let stop = Arc::new(AtomicBool::new(false));
     let barrier = Arc::new(Barrier::new(cpus.len() + 2));
+    let latency_capacity = if measure_latency {
+        usize::try_from(calls.checked_mul(producer_count as u64).ok_or("sample count overflow")?)?
+    } else {
+        0
+    };
     let consumer = {
         let stop = stop.clone();
         let barrier = barrier.clone();
-        thread::spawn(move || consume(ring, stop, barrier, consumer_cpu))
+        thread::spawn(move || {
+            consume(
+                ring,
+                stop,
+                barrier,
+                consumer_cpu,
+                measure_latency,
+                pause_every,
+                pause_us,
+                latency_capacity,
+            )
+        })
     };
     let sink = fs::File::options().write(true).open("/dev/null")?;
     let path = CString::new("/dev/null")?;
@@ -130,11 +149,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     config.set(0, &config_value, 0)?;
     drop(bpfs);
     stop.store(true, Ordering::Release);
-    let (received, cpu_ns, checksum) = consumer.join().map_err(|_| "consumer panic")??;
+    let (received, cpu_ns, checksum, mut latencies) =
+        consumer.join().map_err(|_| "consumer panic")??;
+    latencies.sort_unstable();
+    let (latency_p50_ns, latency_p95_ns, latency_p99_ns, latency_max_ns) =
+        latency_summary(&latencies);
     let dropped: u64 = dropped.get(&0, 0)?.iter().sum();
     let requested = calls * producer_count as u64;
     println!(
-        "mode=aya shape={} attachment=cpu_filtered_gated_v3 requested={} received={} dropped={} unaccounted={} loss_pct={:.4} producer_seconds={:.6} requested_per_second={:.0} consumer_cpu_ms={:.3} checksum={}",
+        "mode=aya shape={} attachment=cpu_filtered_gated_v3 requested={} received={} dropped={} unaccounted={} loss_pct={:.4} producer_seconds={:.6} requested_per_second={:.0} consumer_cpu_ms={:.3} latency_samples={} latency_p50_ns={latency_p50_ns} latency_p95_ns={latency_p95_ns} latency_p99_ns={latency_p99_ns} latency_max_ns={latency_max_ns} checksum={}",
         if mode == 1 { "string" } else { "bytes" },
         requested,
         received,
@@ -144,6 +167,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         producer_seconds,
         requested as f64 / producer_seconds,
         cpu_ns as f64 / 1e6,
+        latencies.len(),
         checksum
     );
     Ok(())
@@ -154,19 +178,26 @@ fn consume(
     stop: Arc<AtomicBool>,
     barrier: Arc<Barrier>,
     cpu: usize,
-) -> std::io::Result<(u64, u64, u64)> {
+    measure_latency: bool,
+    pause_every: u64,
+    pause_us: u64,
+    latency_capacity: usize,
+) -> std::io::Result<(u64, u64, u64, Vec<u64>)> {
     pin(cpu)?;
     barrier.wait();
     let start = cpu_ns();
     let (mut n, mut sum) = (0u64, 0u64);
+    let mut latencies = Vec::with_capacity(latency_capacity);
     loop {
         while let Some(item) = ring.next() {
-            if item.len() == size_of::<DynamicEvent>() {
-                let event = unsafe { &*item.as_ptr().cast::<DynamicEvent>() };
+            if item.len() >= 16 {
+                let timestamp_ns = unsafe { item.as_ptr().cast::<u64>().read_unaligned() };
                 n += 1;
-                sum = sum
-                    .wrapping_add(event.timestamp_ns)
-                    .wrapping_add(event.payload[0] as u64);
+                sum = sum.wrapping_add(timestamp_ns);
+                if measure_latency {
+                    latencies.push(monotonic_ns().saturating_sub(timestamp_ns));
+                }
+                maybe_pause(n, pause_every, pause_us);
             }
         }
         if stop.load(Ordering::Acquire) {
@@ -174,7 +205,7 @@ fn consume(
         }
         std::hint::spin_loop();
     }
-    Ok((n, cpu_ns() - start, sum))
+    Ok((n, cpu_ns() - start, sum, latencies))
 }
 fn trigger(mode: u32, path: &CString, fd: RawFd, payload: &[u8; 128]) {
     if mode == 1 {
@@ -236,4 +267,42 @@ fn cpu_ns() -> u64 {
     };
     unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut t) };
     t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64
+}
+
+fn monotonic_ns() -> u64 {
+    let mut t = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
+    t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64
+}
+
+fn latency_summary(values: &[u64]) -> (u64, u64, u64, u64) {
+    let percentile = |numerator: usize| {
+        values
+            .get(values.len().saturating_sub(1) * numerator / 100)
+            .copied()
+            .unwrap_or(0)
+    };
+    (
+        percentile(50),
+        percentile(95),
+        percentile(99),
+        values.last().copied().unwrap_or(0),
+    )
+}
+
+fn env_u64(name: &str) -> Result<u64, Box<dyn Error>> {
+    Ok(std::env::var(name)
+        .ok()
+        .map(|value| value.parse())
+        .transpose()?
+        .unwrap_or(0))
+}
+
+fn maybe_pause(received: u64, every: u64, pause_us: u64) {
+    if every != 0 && pause_us != 0 && received % every == 0 {
+        thread::sleep(std::time::Duration::from_micros(pause_us));
+    }
 }

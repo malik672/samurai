@@ -1137,6 +1137,51 @@ field:size_t count; offset:32; size:8; signed:0;
     }
 
     #[test]
+    fn builtin_connect_policy_captures_bounded_sockaddr() {
+        let format = r#"
+field:int fd; offset:16; size:8; signed:0;
+field:struct sockaddr * uservaddr; offset:24; size:8; signed:0;
+field:int addrlen; offset:32; size:8; signed:0;
+"#;
+        let selected = ["uservaddr".to_owned()];
+        let plan = capture_plan_with_registry(
+            "syscalls",
+            "sys_enter_connect",
+            format,
+            Some(&selected),
+            DEFAULT_DYNAMIC_CAPTURE_BYTES,
+            PolicyRegistry::builtin(),
+        )
+        .unwrap();
+
+        assert_eq!(plan.fields[0].kind, CaptureKind::UserBytes);
+        assert_eq!(plan.fields[0].length_source, Some((32, 8)));
+        assert_eq!(plan.operations().unwrap().len(), 17);
+    }
+
+    #[test]
+    fn builtin_statx_policy_captures_filename_but_not_output_buffer() {
+        let format = r#"
+field:int dfd; offset:16; size:8; signed:0;
+field:const char * filename; offset:24; size:8; signed:0;
+field:struct statx * buffer; offset:48; size:8; signed:0;
+"#;
+        let selected = ["filename".to_owned(), "buffer".to_owned()];
+        let plan = capture_plan_with_registry(
+            "syscalls",
+            "sys_enter_statx",
+            format,
+            Some(&selected),
+            DEFAULT_DYNAMIC_CAPTURE_BYTES,
+            PolicyRegistry::builtin(),
+        )
+        .unwrap();
+
+        assert_eq!(plan.fields[0].kind, CaptureKind::UserString);
+        assert_eq!(plan.fields[1].kind, CaptureKind::PointerAddress);
+    }
+
+    #[test]
     fn builtin_execve_policy_lowers_filename_as_user_string() {
         let format = r#"
 field:unsigned short common_type; offset:0; size:2; signed:0;

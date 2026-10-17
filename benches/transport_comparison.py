@@ -87,7 +87,7 @@ def parse_rss(path):
     return rss
 
 
-def run_measured(command):
+def run_measured(command, env=None):
     with tempfile.TemporaryDirectory() as directory:
         directory = Path(directory)
         perf_output = directory / "perf.csv"
@@ -98,7 +98,7 @@ def run_measured(command):
             "-e", EVENTS, "--", *map(str, command),
         ]
         started_ns = time.perf_counter_ns()
-        completed = subprocess.run(wrapped, text=True, capture_output=True)
+        completed = subprocess.run(wrapped, text=True, capture_output=True, env=env)
         elapsed_ns = time.perf_counter_ns() - started_ns
         if completed.returncode:
             raise RuntimeError(completed.stdout + completed.stderr)
@@ -130,6 +130,11 @@ def run_measured(command):
             "page_faults": perf.get("page-faults"),
             "max_rss_kib": max_rss_kib,
             "max_backlog": int(fields["max_backlog"]) if "max_backlog" in fields else None,
+            "latency_samples": int(fields.get("latency_samples", 0)),
+            "latency_p50_ns": int(fields.get("latency_p50_ns", 0)),
+            "latency_p95_ns": int(fields.get("latency_p95_ns", 0)),
+            "latency_p99_ns": int(fields.get("latency_p99_ns", 0)),
+            "latency_max_ns": int(fields.get("latency_max_ns", 0)),
             "map_bytes": int(fields["map_bytes"]) if "map_bytes" in fields else 4 << 20,
             "stdout": completed.stdout,
             "stderr": completed.stderr,

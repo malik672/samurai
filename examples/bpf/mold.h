@@ -19,7 +19,9 @@ struct map_def { u32 type, key_size, value_size, max_entries, map_flags; };
 #define MOLD_WRITING (1ULL << 63)
 #define BPF_F_MMAPABLE (1U << 10)
 
-struct mold_slot { u64 mark, kind, words[MOLD_WORDS]; };
+struct __attribute__((aligned(64))) mold_slot {
+    u64 mark, kind, words[MOLD_WORDS];
+};
 struct mold_frontier {
     u64 producer_mark;
     u64 producer_padding[7];
@@ -43,16 +45,15 @@ struct map_def cursors = {6, sizeof(u32), sizeof(u64), 1, 0};
 static void *(*const map_lookup_elem)(void *, const void *) = (void *)1;
 
 static __attribute__((always_inline)) int
-mold_publish(u32 cpu, const u64 words[MOLD_WORDS]) {
+mold_publish(u32 lane, const u64 words[MOLD_WORDS]) {
     u32 zero = 0;
-    if (cpu >= MOLD_LANES) return 0;
     u64 *cursor = map_lookup_elem(&cursors, &zero);
     if (!cursor) return 0;
     u64 mark = *cursor + 1;
     *cursor = mark;
-    u32 key = cpu * MOLD_CAPACITY + ((u32)(mark - 1) & (MOLD_CAPACITY - 1));
+    u32 key = lane * MOLD_CAPACITY + ((u32)(mark - 1) & (MOLD_CAPACITY - 1));
     struct mold_slot *slot = map_lookup_elem(&slots, &key);
-    struct mold_frontier *frontier = map_lookup_elem(&frontiers, &cpu);
+    struct mold_frontier *frontier = map_lookup_elem(&frontiers, &lane);
     if (!slot || !frontier) return 0;
 
     __sync_lock_test_and_set(&slot->mark, MOLD_WRITING | mark);
