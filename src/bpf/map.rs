@@ -225,6 +225,38 @@ impl HashMap {
         })?);
         syscall::update_map_value(self.fd.as_fd(), key, value)
     }
+
+    pub fn key_size(&self) -> usize {
+        self.obj.key_size() as usize
+    }
+
+    pub fn value_size(&self) -> usize {
+        self.obj.value_size() as usize
+    }
+
+    pub fn max_entries(&self) -> usize {
+        self.obj.max_entries() as usize
+    }
+
+    pub fn next_key(&self, key: Option<&[u8]>, next: &mut [u8]) -> io::Result<bool> {
+        if key.is_some_and(|key| key.len() != self.key_size()) || next.len() != self.key_size() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid hash-map key size",
+            ));
+        }
+        syscall::next_map_key(self.fd.as_fd(), key, next)
+    }
+
+    pub fn read(&self, key: &[u8], value: &mut [u8]) -> io::Result<()> {
+        if key.len() != self.key_size() || value.len() != self.value_size() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid hash-map lookup buffer size",
+            ));
+        }
+        syscall::lookup_map_bytes(self.fd.as_fd(), key, value)
+    }
 }
 
 impl PerCpuArrayMap {

@@ -83,8 +83,8 @@ fn main() -> io::Result<()> {
         .map(|lane| mold.worker(lane))
         .collect::<io::Result<Vec<_>>>()?;
     let program = loaded
-        .program("record_generic_tracepoint")
-        .ok_or_else(|| missing("record_generic_tracepoint"))?;
+        .program("record_generic_tracepoint_0")
+        .ok_or_else(|| missing("record_generic_tracepoint_0"))?;
     let attachment = program.attach_to_cpu(&resolver, "syscalls", "sys_enter_openat", cpu)?;
 
     call_openat(CString::new("/dev/null").unwrap().as_ptr());

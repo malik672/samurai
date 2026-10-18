@@ -4,7 +4,9 @@
 #endif
 #include "mold.h"
 
-#define CAPTURE_OPERATIONS 32
+#define CAPTURE_EVENTS 8
+#define CAPTURE_OPERATIONS 30
+#define CAPTURE_OPERATION_SLOTS (CAPTURE_EVENTS * CAPTURE_OPERATIONS)
 #define CAPTURE_SIGNED 1U
 #define CAPTURE_DATA_LOC 2U
 #define CAPTURE_RELATIVE 4U
@@ -16,6 +18,7 @@
 static u64 (*const ktime_get_ns)(void) = (void *)5;
 static u64 (*const get_smp_processor_id)(void) = (void *)8;
 static u64 (*const get_current_pid_tgid)(void) = (void *)14;
+static long (*const get_current_comm)(void *, u32) = (void *)16;
 static long (*const map_update_elem)(void *, const void *, const void *, u64) = (void *)2;
 static long (*const map_delete_elem)(void *, const void *) = (void *)3;
 static long (*const probe_read_kernel)(void *, u32, const void *) = (void *)113;
@@ -42,6 +45,13 @@ struct pid_filter_configuration {
     u32 enabled;
     u32 fork_parent_pid_offset;
     u32 fork_child_pid_offset;
+    u32 fork_child_comm_offset;
+};
+
+struct process_metadata_value {
+    u32 parent_pid;
+    u32 reserved;
+    char comm[16];
 };
 
 /* Values are compact lane indexes plus one; zero means the CPU is disabled. */
@@ -49,11 +59,11 @@ __attribute__((section("maps"), used))
 struct map_def cpu_to_lane = {2, sizeof(u32), sizeof(u32), 1, 0};
 
 __attribute__((section("maps"), used))
-struct map_def capture_config = {2, sizeof(u32), sizeof(u64), 1, 0};
+struct map_def capture_config = {2, sizeof(u32), sizeof(u64), CAPTURE_EVENTS, 0};
 
 __attribute__((section("maps"), used))
 struct map_def capture_operations = {
-    2, sizeof(u32), sizeof(struct capture_operation), CAPTURE_OPERATIONS, 0
+    2, sizeof(u32), sizeof(struct capture_operation), CAPTURE_OPERATION_SLOTS, 0
 };
 
 __attribute__((section("maps"), used))
@@ -68,13 +78,18 @@ __attribute__((section("maps"), used))
 struct map_def tracked_pids = {1, sizeof(u32), sizeof(unsigned char), TRACKED_PID_CAPACITY, 0};
 
 __attribute__((section("maps"), used))
+struct map_def process_metadata = {
+    1, sizeof(u32), sizeof(struct process_metadata_value), TRACKED_PID_CAPACITY, 0
+};
+
+__attribute__((section("maps"), used))
 struct map_def pid_filter_config = {
     2, sizeof(u32), sizeof(struct pid_filter_configuration), 1, 0
 };
 
-/* Insertion failures, successful child insertions, and successful removals. */
+/* PID insertion failures, child insertions, removals, and metadata failures. */
 __attribute__((section("maps"), used))
-struct map_def pid_filter_stats = {2, sizeof(u32), sizeof(u64), 3, 0};
+struct map_def pid_filter_stats = {2, sizeof(u32), sizeof(u64), 4, 0};
 
 static __attribute__((always_inline)) void increment_pid_stat(u32 index) {
     u64 *value = map_lookup_elem(&pid_filter_stats, &index);
@@ -91,7 +106,8 @@ int track_process_fork(void *ctx) {
     struct pid_filter_configuration *config = map_lookup_elem(&pid_filter_config, &zero);
     if (!config || !config->enabled) return 0;
     if (config->fork_parent_pid_offset > 4096U ||
-        config->fork_child_pid_offset > 4096U)
+        config->fork_child_pid_offset > 4096U ||
+        config->fork_child_comm_offset > 4096U)
         return 0;
     u32 parent_pid = 0;
     u32 child_pid = 0;
@@ -107,6 +123,29 @@ int track_process_fork(void *ctx) {
     } else {
         increment_pid_stat(1);
     }
+    struct process_metadata_value metadata = {};
+    metadata.parent_pid = (u32)(get_current_pid_tgid() >> 32);
+    if (probe_read_kernel(metadata.comm, sizeof(metadata.comm),
+                          (const char *)ctx + config->fork_child_comm_offset) < 0 ||
+        map_update_elem(&process_metadata, &child_pid, &metadata, 0) < 0)
+        increment_pid_stat(3);
+    return 0;
+}
+
+__attribute__((section("tracepoint/samurai/track_exec"), used))
+int track_process_exec(void *ctx) {
+    (void)ctx;
+    u64 identity = get_current_pid_tgid();
+    u32 pid = (u32)(identity >> 32);
+    if (!pid_is_tracked(pid)) return 0;
+    struct process_metadata_value *metadata =
+        map_lookup_elem(&process_metadata, &pid);
+    if (!metadata) {
+        increment_pid_stat(3);
+        return 0;
+    }
+    if (get_current_comm(metadata->comm, sizeof(metadata->comm)) < 0)
+        increment_pid_stat(3);
     return 0;
 }
 
@@ -409,14 +448,15 @@ store_captured(u32 index, struct capture_scratch *scratch, u64 value) {
     }
 }
 
-__attribute__((section("tracepoint/samurai/generic"), used))
-int record_generic_tracepoint(void *ctx) {
+static __attribute__((always_inline)) int
+record_generic_tracepoint(void *ctx, u32 event_id) {
     u32 zero = 0;
     struct pid_filter_configuration *pid_config =
         map_lookup_elem(&pid_filter_config, &zero);
-    u32 pid = (u32)(get_current_pid_tgid() >> 32);
+    u64 identity = get_current_pid_tgid();
+    u32 pid = (u32)(identity >> 32);
     if (!pid_config || (pid_config->enabled && !pid_is_tracked(pid))) return 0;
-    u64 *configured_count = map_lookup_elem(&capture_config, &zero);
+    u64 *configured_count = map_lookup_elem(&capture_config, &event_id);
     if (!configured_count || *configured_count > CAPTURE_OPERATIONS) return 0;
     u64 operation_count = *configured_count;
     struct capture_scratch *scratch = map_lookup_elem(&capture_scratch, &zero);
@@ -428,12 +468,15 @@ int record_generic_tracepoint(void *ctx) {
     u32 lane = *encoded_lane - 1;
     scratch->words[0] = ktime_get_ns();
     scratch->words[1] = ((u64)pid << 32) | cpu;
+    scratch->words[MOLD_WORDS - 2] = (u32)identity;
+    scratch->words[MOLD_WORDS - 1] = event_id;
+    u32 operation_base = event_id * CAPTURE_OPERATIONS;
 
 #define CAPTURE_INDEX(index)                                                   \
     if (operation_count > (index)) {                                           \
         u64 captured;                                                          \
-        if (!capture_one(ctx, (index), scratch, &captured)) return 0;          \
-        if (!store_captured((index), scratch, captured)) return 0;              \
+        if (!capture_one(ctx, operation_base + (index), scratch, &captured)) return 0; \
+        if (!store_captured(operation_base + (index), scratch, captured)) return 0; \
     }
     CAPTURE_INDEX(0);
     CAPTURE_INDEX(1);
@@ -466,12 +509,26 @@ int record_generic_tracepoint(void *ctx) {
     CAPTURE_INDEX(28);
     CAPTURE_INDEX(29);
     CAPTURE_INDEX(30);
-    CAPTURE_INDEX(31);
 #undef CAPTURE_INDEX
 
     mold_publish(lane, scratch->words);
     return 0;
 }
+
+#define DEFINE_CAPTURE_PROGRAM(index)                                          \
+    __attribute__((section("tracepoint/samurai/generic_" #index), used))       \
+    int record_generic_tracepoint_##index(void *ctx) {                         \
+        return record_generic_tracepoint(ctx, index);                          \
+    }
+DEFINE_CAPTURE_PROGRAM(0)
+DEFINE_CAPTURE_PROGRAM(1)
+DEFINE_CAPTURE_PROGRAM(2)
+DEFINE_CAPTURE_PROGRAM(3)
+DEFINE_CAPTURE_PROGRAM(4)
+DEFINE_CAPTURE_PROGRAM(5)
+DEFINE_CAPTURE_PROGRAM(6)
+DEFINE_CAPTURE_PROGRAM(7)
+#undef DEFINE_CAPTURE_PROGRAM
 
 __attribute__((section("license"), used))
 char program_license[] = "GPL";

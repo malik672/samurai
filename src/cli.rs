@@ -4,10 +4,10 @@ use crate::{
     bpf::object::ObjectLoader,
     mold::{MappedMold, MappedMoldWorker, MoldEntry},
     policy::PolicyRegistry,
-    smr::{EncodedBatch, SmrWriter},
+    smr::{EncodedBatch, PROCESS_COMM_BYTES, PROCESS_METADATA_CAPACITY, SmrProcess, SmrWriter},
     tracepoint_schema::{
         CaptureField, CaptureKind, CapturePlan, DEFAULT_DYNAMIC_CAPTURE_BYTES,
-        GENERIC_CAPTURE_WORDS, capture_plan_with_registry, parse_format,
+        GENERIC_CAPTURE_WORDS, TracepointField, capture_plan_with_registry, parse_format,
     },
     utils::tracepoint::TracepointResolver,
 };
@@ -32,6 +32,8 @@ use std::{
 const RECORD_BATCH_SIZE: usize = 256;
 const RECORD_QUEUE_BATCHES: usize = 64;
 const DATA_FRAME_BYTES: usize = 1 + 4 + GENERIC_CAPTURE_WORDS * 8;
+const PROCESS_METADATA_VALUE_BYTES: usize = 8 + PROCESS_COMM_BYTES;
+const CAPTURE_OPERATIONS_PER_EVENT: usize = GENERIC_CAPTURE_WORDS - 4;
 
 struct WriterBatch {
     lane: usize,
@@ -41,6 +43,13 @@ struct WriterBatch {
 struct PausedCommand {
     child: Child,
     release: Option<OwnedFd>,
+}
+
+struct SudoIdentity {
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    user: String,
+    home: String,
 }
 
 impl PausedCommand {
@@ -146,7 +155,77 @@ pub fn run_trace(
 ) -> io::Result<()> {
     let resolver = TracepointResolver::new();
     let plan = CapturePlan::discover(&resolver, category, event, fields)?;
-    let operations = plan.operations()?;
+    run_capture(
+        resolver,
+        vec![plan],
+        cpu_spec,
+        target_pid,
+        command,
+        count_limit,
+        duration,
+        output_path,
+        object_path,
+    )
+}
+
+pub fn run_files_preset(
+    cpu_spec: Option<&str>,
+    target_pid: Option<u32>,
+    command: Option<&str>,
+    count_limit: Option<u64>,
+    duration: Option<Duration>,
+    output_path: &Path,
+) -> io::Result<()> {
+    let resolver = TracepointResolver::new();
+    let specifications: [(&str, &[&str]); 8] = [
+        ("sys_enter_openat", &["filename", "flags", "mode"]),
+        ("sys_exit_openat", &["ret"]),
+        ("sys_enter_close", &["fd"]),
+        ("sys_exit_close", &["ret"]),
+        ("sys_enter_read", &["fd", "count"]),
+        ("sys_exit_read", &["ret"]),
+        ("sys_enter_write", &["fd", "count"]),
+        ("sys_exit_write", &["ret"]),
+    ];
+    let plans = specifications
+        .into_iter()
+        .map(|(event, fields)| {
+            let fields = fields
+                .iter()
+                .map(|field| (*field).to_owned())
+                .collect::<Vec<_>>();
+            CapturePlan::discover(&resolver, "syscalls", event, Some(&fields))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    run_capture(
+        resolver,
+        plans,
+        cpu_spec,
+        target_pid,
+        command,
+        count_limit,
+        duration,
+        output_path,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_capture(
+    resolver: TracepointResolver,
+    plans: Vec<CapturePlan>,
+    cpu_spec: Option<&str>,
+    target_pid: Option<u32>,
+    command: Option<&str>,
+    count_limit: Option<u64>,
+    duration: Option<Duration>,
+    output_path: &Path,
+    object_path: Option<&Path>,
+) -> io::Result<()> {
+    let operations = plans
+        .iter()
+        .map(CapturePlan::operations)
+        .collect::<io::Result<Vec<_>>>()?;
     if command.is_some_and(|command| command.trim().is_empty()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -154,9 +233,9 @@ pub fn run_trace(
         ));
     }
     let pid_filter_requested = target_pid.is_some() || command.is_some();
-    let fork_pid_offsets = pid_filter_requested
+    let fork_metadata_offsets = pid_filter_requested
         .then_some(())
-        .map(|_| discover_fork_pid_offsets(&resolver))
+        .map(|_| discover_fork_metadata_offsets(&resolver))
         .transpose()?;
 
     let mut loader = match object_path {
@@ -176,15 +255,21 @@ pub fn run_trace(
     let loaded = loader.load()?;
     let mut profiled_command = command.map(spawn_paused_command).transpose()?;
     let filter_pid = target_pid.or_else(|| profiled_command.as_ref().map(PausedCommand::pid));
-    loaded
+    let capture_config = loaded
         .map("capture_config")
-        .ok_or_else(|| missing("capture_config"))?
-        .write(0, &(operations.len() as u64).to_ne_bytes())?;
+        .ok_or_else(|| missing("capture_config"))?;
     let operation_map = loaded
         .map("capture_operations")
         .ok_or_else(|| missing("capture_operations"))?;
-    for (index, operation) in operations.iter().enumerate() {
-        operation_map.write(index as u32, &operation.to_bytes())?;
+    for (event_id, event_operations) in operations.iter().enumerate() {
+        capture_config.write(
+            event_id as u32,
+            &(event_operations.len() as u64).to_ne_bytes(),
+        )?;
+        for (index, operation) in event_operations.iter().enumerate() {
+            let slot = event_id * CAPTURE_OPERATIONS_PER_EVENT + index;
+            operation_map.write(slot as u32, &operation.to_bytes())?;
+        }
     }
     let cpu_to_lane = loaded
         .map("cpu_to_lane")
@@ -202,13 +287,17 @@ pub fn run_trace(
         let tracked_pids = loaded
             .hash_map("tracked_pids")
             .ok_or_else(|| missing("tracked_pids"))?;
-        seed_process_tree(pid, tracked_pids)?;
-        let (parent_offset, child_offset) =
-            fork_pid_offsets.expect("PID filtering discovered the fork schema");
-        let mut config = [0u8; 12];
+        let process_metadata = loaded
+            .hash_map("process_metadata")
+            .ok_or_else(|| missing("process_metadata"))?;
+        seed_process_tree(pid, tracked_pids, process_metadata)?;
+        let (parent_offset, child_offset, child_comm_offset) =
+            fork_metadata_offsets.expect("PID filtering discovered the fork schema");
+        let mut config = [0u8; 16];
         config[..4].copy_from_slice(&1u32.to_ne_bytes());
         config[4..8].copy_from_slice(&parent_offset.to_ne_bytes());
         config[8..12].copy_from_slice(&child_offset.to_ne_bytes());
+        config[12..16].copy_from_slice(&child_comm_offset.to_ne_bytes());
         loaded
             .map("pid_filter_config")
             .ok_or_else(|| missing("pid_filter_config"))?
@@ -227,9 +316,15 @@ pub fn run_trace(
                 .ok_or_else(|| missing("track_process_exit"))?
                 .attach(&resolver, "sched", "sched_process_exit")?,
         );
+        lifecycle_attachments.push(
+            loaded
+                .program("track_process_exec")
+                .ok_or_else(|| missing("track_process_exec"))?
+                .attach(&resolver, "sched", "sched_process_exec")?,
+        );
         // Close the ordinary setup race for descendants created during the
         // first /proc walk. Future children are propagated by BPF.
-        seed_process_tree(pid, tracked_pids)?;
+        seed_process_tree(pid, tracked_pids, process_metadata)?;
     }
 
     let slots = loaded
@@ -247,8 +342,8 @@ pub fn run_trace(
             "loaded Mold lane count does not match the selected CPUs",
         ));
     }
-    let writer = SmrWriter::create(output_path, &plan, &cpus)?;
-    let record_words = plan.words;
+    let writer = SmrWriter::create_multi(output_path, &plans, &cpus)?;
+    let event_words = plans.iter().map(|plan| plan.words).collect::<Vec<_>>();
     let (sender, receiver) = sync_channel::<WriterBatch>(RECORD_QUEUE_BATCHES);
     let mut recycle_receivers = Vec::with_capacity(cpus.len());
     let mut recycle_senders = Vec::with_capacity(cpus.len());
@@ -258,7 +353,7 @@ pub fn run_trace(
             recycle_sender
                 .send(Box::new(EncodedBatch::with_capacity(
                     RECORD_BATCH_SIZE * DATA_FRAME_BYTES,
-                    record_words,
+                    &event_words,
                 )))
                 .map_err(|_| io::Error::other("failed to initialize SMR buffer pool"))?;
         }
@@ -267,10 +362,18 @@ pub fn run_trace(
     }
     // One global attachment observes every CPU. `cpu_to_lane` is the in-BPF
     // CPU filter and maps enabled CPU IDs onto compact Mold lanes.
-    let attachments = [loaded
-        .program("record_generic_tracepoint")
-        .ok_or_else(|| missing("record_generic_tracepoint"))?
-        .attach(&resolver, category, event)?];
+    let attachments = plans
+        .iter()
+        .enumerate()
+        .map(|(event_id, plan)| {
+            let name = format!("record_generic_tracepoint_{event_id}");
+            loaded.program(&name).ok_or_else(|| missing(&name))?.attach(
+                &resolver,
+                &plan.category,
+                &plan.event,
+            )
+        })
+        .collect::<io::Result<Vec<_>>>()?;
 
     install_stop_handlers()?;
     let deadline = duration
@@ -283,6 +386,11 @@ pub fn run_trace(
     let recording = AtomicBool::new(true);
     let worker_failed = AtomicBool::new(false);
     let received_total = AtomicU64::new(0);
+    let mut process_metadata = Vec::with_capacity(if filter_pid.is_some() {
+        PROCESS_METADATA_CAPACITY
+    } else {
+        0
+    });
     let (results, writer, command_status) = thread::scope(|scope| -> io::Result<_> {
         let writer_handle = scope.spawn(move || -> io::Result<SmrWriter> {
             let mut writer = writer;
@@ -310,7 +418,6 @@ pub fn run_trace(
                         worker,
                         lane,
                         cpu,
-                        record_words,
                         recording,
                         received_total,
                         sender,
@@ -370,7 +477,6 @@ pub fn run_trace(
     })?;
     let received = results.iter().map(|result| result.received).sum::<u64>();
     let dropped = results.iter().map(|result| result.dropped).sum::<u64>();
-    let bytes = writer.finish(received, dropped)?;
     let mut tracked_descendants = None;
     if filter_pid.is_some() {
         let stats = loaded
@@ -379,16 +485,30 @@ pub fn run_trace(
         let insertion_failures = stats.read_u64(0)?;
         let descendants_added = stats.read_u64(1)?;
         let tasks_removed = stats.read_u64(2)?;
+        let metadata_failures = stats.read_u64(3)?;
         if insertion_failures != 0 {
             return Err(io::Error::other(format!(
                 "PID filter capacity was exhausted; {insertion_failures} descendants were not tracked"
             )));
         }
+        if metadata_failures != 0 {
+            return Err(io::Error::other(format!(
+                "process metadata capture failed {metadata_failures} times"
+            )));
+        }
+        read_process_metadata(
+            loaded
+                .hash_map("process_metadata")
+                .ok_or_else(|| missing("process_metadata"))?,
+            &mut process_metadata,
+        )?;
         tracked_descendants = Some((descendants_added, tasks_removed));
     }
+    let bytes = writer.finish(received, dropped, &process_metadata)?;
     println!(
-        "recorded={} received={received} dropped={dropped} bytes={bytes} event={category}:{event} cpus={cpus:?}",
-        output_path.display()
+        "recorded={} received={received} dropped={dropped} bytes={bytes} events={} cpus={cpus:?}",
+        output_path.display(),
+        plans.len()
     );
     if let Some((descendants_added, tasks_removed)) = tracked_descendants {
         println!("pid_filter_added={descendants_added} pid_filter_removed={tasks_removed}");
@@ -412,6 +532,12 @@ fn spawn_paused_command(command_text: &str) -> io::Result<PausedCommand> {
     let write_fd = pipe[1];
     let sudo_identity = sudo_identity()?;
     let mut command = Command::new("/bin/sh");
+    if let Some(identity) = &sudo_identity {
+        command
+            .env("HOME", &identity.home)
+            .env("USER", &identity.user)
+            .env("LOGNAME", &identity.user);
+    }
     command
         .arg("-c")
         .arg("IFS= read -r _ <&3 || exit 125; exec /bin/sh -c \"$1\"")
@@ -423,10 +549,10 @@ fn spawn_paused_command(command_text: &str) -> io::Result<PausedCommand> {
             if libc::setpgid(0, 0) != 0 {
                 return Err(io::Error::last_os_error());
             }
-            if let Some((uid, gid)) = sudo_identity {
+            if let Some(identity) = &sudo_identity {
                 if libc::setgroups(0, std::ptr::null()) != 0
-                    || libc::setgid(gid) != 0
-                    || libc::setuid(uid) != 0
+                    || libc::setgid(identity.gid) != 0
+                    || libc::setuid(identity.uid) != 0
                 {
                     return Err(io::Error::last_os_error());
                 }
@@ -461,7 +587,7 @@ fn spawn_paused_command(command_text: &str) -> io::Result<PausedCommand> {
     })
 }
 
-fn sudo_identity() -> io::Result<Option<(libc::uid_t, libc::gid_t)>> {
+fn sudo_identity() -> io::Result<Option<SudoIdentity>> {
     let uid = std::env::var_os("SUDO_UID");
     let gid = std::env::var_os("SUDO_GID");
     match (uid, gid) {
@@ -485,7 +611,35 @@ fn sudo_identity() -> io::Result<Option<(libc::uid_t, libc::gid_t)>> {
                         format!("invalid SUDO_GID: {error}"),
                     )
                 })?;
-            Ok(Some((uid, gid)))
+            let passwd = fs::read_to_string("/etc/passwd")?;
+            let mut matching = passwd.lines().filter_map(|line| {
+                let mut fields = line.split(':');
+                let user = fields.next()?;
+                fields.next()?;
+                let candidate_uid = fields.next()?.parse::<libc::uid_t>().ok()?;
+                fields.next()?;
+                fields.next()?;
+                let home = fields.next()?;
+                (candidate_uid == uid).then(|| (user.to_owned(), home.to_owned()))
+            });
+            let (user, home) = matching.next().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "SUDO_UID is absent from /etc/passwd",
+                )
+            })?;
+            if matching.next().is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "SUDO_UID is not unique in /etc/passwd",
+                ));
+            }
+            Ok(Some(SudoIdentity {
+                uid,
+                gid,
+                user,
+                home,
+            }))
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -494,11 +648,11 @@ fn sudo_identity() -> io::Result<Option<(libc::uid_t, libc::gid_t)>> {
     }
 }
 
-fn discover_fork_pid_offsets(resolver: &TracepointResolver) -> io::Result<(u32, u32)> {
+fn discover_fork_metadata_offsets(resolver: &TracepointResolver) -> io::Result<(u32, u32, u32)> {
     let format = resolver.format("sched", "sched_process_fork")?;
     let fields = parse_format(&format)?;
-    let offset = |name: &str| -> io::Result<u32> {
-        let field = fields
+    let field = |name: &str| -> io::Result<&TracepointField> {
+        fields
             .iter()
             .find(|field| field.name == name)
             .ok_or_else(|| {
@@ -506,7 +660,10 @@ fn discover_fork_pid_offsets(resolver: &TracepointResolver) -> io::Result<(u32, 
                     io::ErrorKind::InvalidData,
                     format!("sched_process_fork has no {name} field"),
                 )
-            })?;
+            })
+    };
+    let pid_offset = |name: &str| -> io::Result<u32> {
+        let field = field(name)?;
         if field.size != size_of::<u32>() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -520,10 +677,27 @@ fn discover_fork_pid_offsets(resolver: &TracepointResolver) -> io::Result<(u32, 
             )
         })
     };
-    Ok((offset("parent_pid")?, offset("child_pid")?))
+    let child_comm = field("child_comm")?;
+    if child_comm.size != PROCESS_COMM_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "sched_process_fork child_comm is not 16 bytes",
+        ));
+    }
+    let child_comm_offset = u32::try_from(child_comm.offset)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "child_comm offset exceeds u32"))?;
+    Ok((
+        pid_offset("parent_pid")?,
+        pid_offset("child_pid")?,
+        child_comm_offset,
+    ))
 }
 
-fn seed_process_tree(root: u32, tracked: &crate::bpf::map::HashMap) -> io::Result<()> {
+fn seed_process_tree(
+    root: u32,
+    tracked: &crate::bpf::map::HashMap,
+    metadata: &crate::bpf::map::HashMap,
+) -> io::Result<()> {
     let root_path = format!("/proc/{root}");
     if !Path::new(&root_path).exists() {
         return Err(io::Error::new(
@@ -537,6 +711,9 @@ fn seed_process_tree(root: u32, tracked: &crate::bpf::map::HashMap) -> io::Resul
     pending.push_back(root);
     while let Some(pid) = pending.pop_front() {
         tracked.write(&pid.to_ne_bytes(), &[1])?;
+        if let Some(process) = read_proc_process(pid)? {
+            metadata.write(&pid.to_ne_bytes(), &encode_process_metadata(process))?;
+        }
         let task_path = format!("/proc/{pid}/task");
         let tasks = match fs::read_dir(task_path) {
             Ok(tasks) => tasks,
@@ -567,6 +744,89 @@ fn seed_process_tree(root: u32, tracked: &crate::bpf::map::HashMap) -> io::Resul
                 }
             }
         }
+    }
+    Ok(())
+}
+
+fn read_proc_process(pid: u32) -> io::Result<Option<SmrProcess>> {
+    let status = match fs::read_to_string(format!("/proc/{pid}/status")) {
+        Ok(status) => status,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let parent_pid = status
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "process status lacks PPid"))?
+        .trim()
+        .parse::<u32>()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let mut comm = [0; PROCESS_COMM_BYTES];
+    let name = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Name:"))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "process status lacks Name"))?
+        .trim()
+        .as_bytes();
+    let length = name.len().min(PROCESS_COMM_BYTES - 1);
+    comm[..length].copy_from_slice(&name[..length]);
+    Ok(Some(SmrProcess {
+        pid,
+        parent_pid,
+        comm,
+    }))
+}
+
+fn encode_process_metadata(process: SmrProcess) -> [u8; PROCESS_METADATA_VALUE_BYTES] {
+    let mut value = [0; PROCESS_METADATA_VALUE_BYTES];
+    value[..4].copy_from_slice(&process.parent_pid.to_ne_bytes());
+    value[8..].copy_from_slice(&process.comm);
+    value
+}
+
+fn read_process_metadata(
+    map: &crate::bpf::map::HashMap,
+    processes: &mut Vec<SmrProcess>,
+) -> io::Result<()> {
+    if map.key_size() != size_of::<u32>()
+        || map.value_size() != PROCESS_METADATA_VALUE_BYTES
+        || map.max_entries() != PROCESS_METADATA_CAPACITY
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "process_metadata map does not match the Samurai ABI",
+        ));
+    }
+    let mut key = [0u8; 4];
+    let mut next = [0u8; 4];
+    let mut value = [0u8; PROCESS_METADATA_VALUE_BYTES];
+    let mut has_current = false;
+    while map.next_key(has_current.then_some(key.as_slice()), &mut next)? {
+        key = next;
+        map.read(&key, &mut value)?;
+        let pid = u32::from_ne_bytes(key);
+        let parent_pid = u32::from_ne_bytes(value[..4].try_into().unwrap());
+        if value[4..8] != [0; 4] {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "process metadata reserved bytes are nonzero",
+            ));
+        }
+        let mut comm = [0; PROCESS_COMM_BYTES];
+        comm.copy_from_slice(&value[8..]);
+        processes.push(SmrProcess {
+            pid,
+            parent_pid,
+            comm,
+        });
+        has_current = true;
+    }
+    processes.sort_unstable_by_key(|process| process.pid);
+    if processes.windows(2).any(|pair| pair[0].pid == pair[1].pid) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "process metadata map returned a duplicate PID",
+        ));
     }
     Ok(())
 }
@@ -670,7 +930,6 @@ fn consume_lane(
     mut worker: MappedMoldWorker<'_, '_, GENERIC_CAPTURE_WORDS>,
     lane: usize,
     cpu: usize,
-    record_words: usize,
     recording: &AtomicBool,
     received_total: &AtomicU64,
     sender: SyncSender<WriterBatch>,
@@ -685,25 +944,37 @@ fn consume_lane(
     let mut batch = recycle
         .recv()
         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "SMR writer stopped"))?;
+    let mut idle_polls = 0u32;
     loop {
         match worker.try_next()? {
             Some(MoldEntry::Data(words)) => {
+                idle_polls = 0;
                 result.received += 1;
                 received_total.fetch_add(1, Ordering::Relaxed);
-                batch.push_data(cpu, &words[..record_words]);
+                batch.push_data(cpu, &words)?;
             }
             Some(MoldEntry::Gap(missed)) => {
+                idle_polls = 0;
                 result.dropped += missed;
                 batch.push_gap(cpu, missed);
             }
-            Some(MoldEntry::Done) => {}
+            Some(MoldEntry::Done) => {
+                idle_polls = 0;
+            }
             None => {
                 if !recording.load(Ordering::Acquire) && worker.is_caught_up()? {
                     send_batch(&sender, lane, batch)?;
                     worker.publish_consumer_mark()?;
                     return Ok(result);
                 }
-                std::hint::spin_loop();
+                idle_polls = idle_polls.saturating_add(1);
+                if idle_polls <= 64 {
+                    std::hint::spin_loop();
+                } else if idle_polls <= 128 {
+                    thread::yield_now();
+                } else {
+                    thread::sleep(Duration::from_millis(5));
+                }
             }
         }
         if batch.is_full(RECORD_BATCH_SIZE) {

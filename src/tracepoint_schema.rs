@@ -6,7 +6,7 @@ pub use crate::policy::{CapturePolicy, PointerCapture, PolicyRegistry};
 const MOLD_METADATA_WORDS: usize = 2;
 const BPF_STACK_RECORD_BUDGET: usize = 384;
 pub const GENERIC_CAPTURE_WORDS: usize = 34;
-pub const GENERIC_CAPTURE_OPERATIONS: usize = GENERIC_CAPTURE_WORDS - MOLD_METADATA_WORDS;
+pub const GENERIC_CAPTURE_OPERATIONS: usize = GENERIC_CAPTURE_WORDS - MOLD_METADATA_WORDS - 2;
 pub const DEFAULT_DYNAMIC_CAPTURE_BYTES: usize = 64;
 
 const CAPTURE_SIGNED: u32 = 1 << 0;
@@ -402,6 +402,11 @@ pub fn capture_plan_with_registry(
             .ok_or_else(|| invalid("Mold word count overflows usize"))?;
     }
     validate_record_words(destination_word)?;
+    if destination_word >= GENERIC_CAPTURE_WORDS - 1 {
+        return Err(invalid(
+            "runtime captures reserve the final Mold words for thread and event IDs",
+        ));
+    }
     Ok(CapturePlan {
         category: category.to_owned(),
         event: event.to_owned(),
