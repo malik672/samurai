@@ -5,12 +5,15 @@ high-throughput per-CPU event transport. It discovers tracepoint layouts from
 the running kernel, captures selected fields, follows process descendants, and
 writes versioned `.smr` recordings for offline analysis.
 
+Samurai's main advantage comes from Mold. Each logical CPU publishes into an
+independent preallocated lane instead of competing for a shared reservation
+cursor, allowing high throughput when many CPUs produce events concurrently.
+
 Samurai can currently answer questions such as:
 
 - Which files did a program and its child processes open?
 - Which CPUs and processes produced the most events?
 - Which tracepoint field values occurred most frequently?
-- How many records were lost because the consumer fell behind?
 
 ## Requirements
 
