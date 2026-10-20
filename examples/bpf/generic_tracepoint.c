@@ -4,7 +4,7 @@
 #endif
 #include "mold.h"
 
-#define CAPTURE_EVENTS 8
+#define CAPTURE_EVENTS 47
 #define CAPTURE_OPERATIONS 30
 #define CAPTURE_OPERATION_SLOTS (CAPTURE_EVENTS * CAPTURE_OPERATIONS)
 #define CAPTURE_SIGNED 1U
@@ -199,62 +199,83 @@ read_fixed(void *ctx, u32 source_offset, unsigned short size, u64 *value) {
     }
 }
 
-#define DEFINE_USER_STRING(word)                                                \
-    static __attribute__((noinline)) long read_user_string_##word(              \
+#define DEFINE_USER_STRING(word, bytes)                                         \
+    static __attribute__((noinline)) long read_user_string_##word##_##bytes(    \
         void *ctx, u32 source_offset, u32 pointer_size,                         \
         u32 kernel_memory, struct capture_scratch *scratch) {                   \
         u64 pointer = 0;                                                        \
         if (read_fixed(ctx, source_offset, (unsigned short)pointer_size,         \
                        &pointer) < 0)                                           \
             return -1;                                                         \
-        __builtin_memset(&scratch->words[(word) + 1], 0, 128);                  \
+        __builtin_memset(&scratch->words[(word) + 1], 0, bytes);                \
         if (kernel_memory)                                                      \
-            return probe_read_kernel_str(&scratch->words[(word) + 1], 128,      \
+            return probe_read_kernel_str(&scratch->words[(word) + 1], bytes,    \
                                          (const void *)pointer);                \
-        return probe_read_user_str(&scratch->words[(word) + 1], 128,            \
+        return probe_read_user_str(&scratch->words[(word) + 1], bytes,          \
                                    (const void *)pointer);                      \
     }
-DEFINE_USER_STRING(2)
-DEFINE_USER_STRING(3)
-DEFINE_USER_STRING(4)
-DEFINE_USER_STRING(5)
-DEFINE_USER_STRING(6)
-DEFINE_USER_STRING(7)
-DEFINE_USER_STRING(8)
-DEFINE_USER_STRING(9)
-DEFINE_USER_STRING(10)
-DEFINE_USER_STRING(11)
-DEFINE_USER_STRING(12)
-DEFINE_USER_STRING(13)
-DEFINE_USER_STRING(14)
-DEFINE_USER_STRING(15)
-DEFINE_USER_STRING(16)
-DEFINE_USER_STRING(17)
+#define DEFINE_USER_STRING_SIZES(word) \
+    DEFINE_USER_STRING(word, 96)       \
+    DEFINE_USER_STRING(word, 112)      \
+    DEFINE_USER_STRING(word, 128)
+DEFINE_USER_STRING_SIZES(2)
+DEFINE_USER_STRING_SIZES(3)
+DEFINE_USER_STRING_SIZES(4)
+DEFINE_USER_STRING_SIZES(5)
+DEFINE_USER_STRING_SIZES(6)
+DEFINE_USER_STRING_SIZES(7)
+DEFINE_USER_STRING_SIZES(8)
+DEFINE_USER_STRING_SIZES(9)
+DEFINE_USER_STRING_SIZES(10)
+DEFINE_USER_STRING_SIZES(11)
+DEFINE_USER_STRING_SIZES(12)
+DEFINE_USER_STRING_SIZES(13)
+DEFINE_USER_STRING_SIZES(14)
+DEFINE_USER_STRING_SIZES(15)
+DEFINE_USER_STRING_SIZES(16)
+DEFINE_USER_STRING_SIZES(17)
+#undef DEFINE_USER_STRING_SIZES
 #undef DEFINE_USER_STRING
 
 static __attribute__((always_inline)) long
 read_user_string(void *ctx, struct capture_operation *operation,
                  struct capture_scratch *scratch) {
     u32 kernel_memory = operation->flags & CAPTURE_KERNEL_MEMORY;
+#define READ_USER_STRING(word)                                                  \
+    case word:                                                                  \
+        if (operation->size == 96)                                              \
+            return read_user_string_##word##_96(                               \
+                ctx, operation->source_offset, operation->pointer_size,         \
+                kernel_memory, scratch);                                        \
+        if (operation->size == 112)                                             \
+            return read_user_string_##word##_112(                              \
+                ctx, operation->source_offset, operation->pointer_size,         \
+                kernel_memory, scratch);                                        \
+        if (operation->size == 128)                                             \
+            return read_user_string_##word##_128(                              \
+                ctx, operation->source_offset, operation->pointer_size,         \
+                kernel_memory, scratch);                                        \
+        return -1;
     switch (operation->destination_word) {
-    case 2: return read_user_string_2(ctx, operation->source_offset, operation->pointer_size, kernel_memory, scratch);
-    case 3: return read_user_string_3(ctx, operation->source_offset, operation->pointer_size, kernel_memory, scratch);
-    case 4: return read_user_string_4(ctx, operation->source_offset, operation->pointer_size, kernel_memory, scratch);
-    case 5: return read_user_string_5(ctx, operation->source_offset, operation->pointer_size, kernel_memory, scratch);
-    case 6: return read_user_string_6(ctx, operation->source_offset, operation->pointer_size, kernel_memory, scratch);
-    case 7: return read_user_string_7(ctx, operation->source_offset, operation->pointer_size, kernel_memory, scratch);
-    case 8: return read_user_string_8(ctx, operation->source_offset, operation->pointer_size, kernel_memory, scratch);
-    case 9: return read_user_string_9(ctx, operation->source_offset, operation->pointer_size, kernel_memory, scratch);
-    case 10: return read_user_string_10(ctx, operation->source_offset, operation->pointer_size, kernel_memory, scratch);
-    case 11: return read_user_string_11(ctx, operation->source_offset, operation->pointer_size, kernel_memory, scratch);
-    case 12: return read_user_string_12(ctx, operation->source_offset, operation->pointer_size, kernel_memory, scratch);
-    case 13: return read_user_string_13(ctx, operation->source_offset, operation->pointer_size, kernel_memory, scratch);
-    case 14: return read_user_string_14(ctx, operation->source_offset, operation->pointer_size, kernel_memory, scratch);
-    case 15: return read_user_string_15(ctx, operation->source_offset, operation->pointer_size, kernel_memory, scratch);
-    case 16: return read_user_string_16(ctx, operation->source_offset, operation->pointer_size, kernel_memory, scratch);
-    case 17: return read_user_string_17(ctx, operation->source_offset, operation->pointer_size, kernel_memory, scratch);
+    READ_USER_STRING(2)
+    READ_USER_STRING(3)
+    READ_USER_STRING(4)
+    READ_USER_STRING(5)
+    READ_USER_STRING(6)
+    READ_USER_STRING(7)
+    READ_USER_STRING(8)
+    READ_USER_STRING(9)
+    READ_USER_STRING(10)
+    READ_USER_STRING(11)
+    READ_USER_STRING(12)
+    READ_USER_STRING(13)
+    READ_USER_STRING(14)
+    READ_USER_STRING(15)
+    READ_USER_STRING(16)
+    READ_USER_STRING(17)
     default: return -1;
     }
+#undef READ_USER_STRING
 }
 
 #define DEFINE_MEMORY_READ(size)                                                \
@@ -528,6 +549,45 @@ DEFINE_CAPTURE_PROGRAM(4)
 DEFINE_CAPTURE_PROGRAM(5)
 DEFINE_CAPTURE_PROGRAM(6)
 DEFINE_CAPTURE_PROGRAM(7)
+DEFINE_CAPTURE_PROGRAM(8)
+DEFINE_CAPTURE_PROGRAM(9)
+DEFINE_CAPTURE_PROGRAM(10)
+DEFINE_CAPTURE_PROGRAM(11)
+DEFINE_CAPTURE_PROGRAM(12)
+DEFINE_CAPTURE_PROGRAM(13)
+DEFINE_CAPTURE_PROGRAM(14)
+DEFINE_CAPTURE_PROGRAM(15)
+DEFINE_CAPTURE_PROGRAM(16)
+DEFINE_CAPTURE_PROGRAM(17)
+DEFINE_CAPTURE_PROGRAM(18)
+DEFINE_CAPTURE_PROGRAM(19)
+DEFINE_CAPTURE_PROGRAM(20)
+DEFINE_CAPTURE_PROGRAM(21)
+DEFINE_CAPTURE_PROGRAM(22)
+DEFINE_CAPTURE_PROGRAM(23)
+DEFINE_CAPTURE_PROGRAM(24)
+DEFINE_CAPTURE_PROGRAM(25)
+DEFINE_CAPTURE_PROGRAM(26)
+DEFINE_CAPTURE_PROGRAM(27)
+DEFINE_CAPTURE_PROGRAM(28)
+DEFINE_CAPTURE_PROGRAM(29)
+DEFINE_CAPTURE_PROGRAM(30)
+DEFINE_CAPTURE_PROGRAM(31)
+DEFINE_CAPTURE_PROGRAM(32)
+DEFINE_CAPTURE_PROGRAM(33)
+DEFINE_CAPTURE_PROGRAM(34)
+DEFINE_CAPTURE_PROGRAM(35)
+DEFINE_CAPTURE_PROGRAM(36)
+DEFINE_CAPTURE_PROGRAM(37)
+DEFINE_CAPTURE_PROGRAM(38)
+DEFINE_CAPTURE_PROGRAM(39)
+DEFINE_CAPTURE_PROGRAM(40)
+DEFINE_CAPTURE_PROGRAM(41)
+DEFINE_CAPTURE_PROGRAM(42)
+DEFINE_CAPTURE_PROGRAM(43)
+DEFINE_CAPTURE_PROGRAM(44)
+DEFINE_CAPTURE_PROGRAM(45)
+DEFINE_CAPTURE_PROGRAM(46)
 #undef DEFINE_CAPTURE_PROGRAM
 
 __attribute__((section("license"), used))

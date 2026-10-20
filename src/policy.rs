@@ -39,11 +39,19 @@ pub struct PolicyRegistry {
 }
 
 const fn user_string(event: &'static str, field: &'static str) -> CapturePolicy {
+    user_string_bounded(event, field, 128)
+}
+
+const fn user_string_bounded(
+    event: &'static str,
+    field: &'static str,
+    max_len: usize,
+) -> CapturePolicy {
     CapturePolicy {
         category: "syscalls",
         event,
         field,
-        capture: PointerCapture::UserString { max_len: 128 },
+        capture: PointerCapture::UserString { max_len },
     }
 }
 
@@ -90,12 +98,12 @@ const BUILTIN_POLICIES: &[CapturePolicy] = &[
     user_string("sys_enter_mkdir", "pathname"),
     user_string("sys_enter_mkdirat", "pathname"),
     user_string("sys_enter_rmdir", "pathname"),
-    user_string("sys_enter_rename", "oldname"),
-    user_string("sys_enter_rename", "newname"),
-    user_string("sys_enter_renameat", "oldname"),
-    user_string("sys_enter_renameat", "newname"),
-    user_string("sys_enter_renameat2", "oldname"),
-    user_string("sys_enter_renameat2", "newname"),
+    user_string_bounded("sys_enter_rename", "oldname", 112),
+    user_string_bounded("sys_enter_rename", "newname", 112),
+    user_string_bounded("sys_enter_renameat", "oldname", 96),
+    user_string_bounded("sys_enter_renameat", "newname", 96),
+    user_string_bounded("sys_enter_renameat2", "oldname", 96),
+    user_string_bounded("sys_enter_renameat2", "newname", 96),
     user_string("sys_enter_link", "oldname"),
     user_string("sys_enter_link", "newname"),
     user_string("sys_enter_linkat", "oldname"),

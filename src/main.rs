@@ -44,10 +44,25 @@ enum Command {
         #[arg(long)]
         fields: Option<String>,
     },
-    /// Validate and summarize a completed .smr recording.
+    /// Generate a self-contained HTML report from a completed .smr recording.
     Report {
         /// Recording produced by `samurai trace --output`.
         recording: PathBuf,
+        /// HTML file to create; defaults to the recording name with an .html extension.
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Maximum entries to show in each ranked section.
+        #[arg(long, default_value_t = 20, value_parser = parse_positive_usize)]
+        top: usize,
+        /// Include only this PID. May be repeated.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        pid: Vec<u32>,
+        /// Include only processes with this exact captured name. May be repeated.
+        #[arg(long)]
+        process: Vec<String>,
+        /// Exclude processes with this exact captured name. May be repeated.
+        #[arg(long)]
+        exclude_process: Vec<String>,
     },
     /// Stream a completed .smr recording and rank its busiest CPUs, PIDs, and field values.
     Analyze {
@@ -148,29 +163,24 @@ fn main() -> ExitCode {
                 .transpose()?;
             samurai::cli::run_validate(&category, &event, fields.as_deref())
         }),
-        Command::Report { recording } => samurai::smr::inspect(&recording).map(|summary| {
-            println!("recording={}", recording.display());
-            println!("version={}", summary.version);
-            println!("events={}", summary.events.len());
-            for event in &summary.events {
-                println!(
-                    "event={}:{} fields={}",
-                    event.category,
-                    event.event,
-                    event
-                        .fields
-                        .iter()
-                        .map(|field| field.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(",")
-                );
-            }
-            println!("cpus={:?}", summary.cpus);
-            println!("received={}", summary.received);
-            println!("dropped={}", summary.dropped);
-            println!("processes={}", summary.processes.len());
-            println!("bytes={}", summary.bytes);
-        }),
+        Command::Report {
+            recording,
+            output,
+            top,
+            pid,
+            process,
+            exclude_process,
+        } => {
+            let output = output.unwrap_or_else(|| recording.with_extension("html"));
+            let selection = samurai::report::Selection {
+                pids: pid,
+                processes: process,
+                excluded_processes: exclude_process,
+            };
+            samurai::report::write_html(&recording, &output, top, &selection).map(|()| {
+                println!("report={}", output.display());
+            })
+        }
         Command::Analyze {
             recording,
             top,
@@ -228,7 +238,7 @@ fn main() -> ExitCode {
                 }
                 for file in files.iter().take(top) {
                     println!(
-                        "  {:?}: opens={} closes={} read={}/{} requested write={}/{} requested errors={}",
+                        "  {:?}: opens={} closes={} read={}/{} requested write={}/{} requested dup={} sync={} mmap={}/{} munmap={}/{} exec_release={}/{} still_tracked={} rename={} unlink={} mkdir={} errors={}",
                         file.path,
                         file.opens,
                         file.closes,
@@ -236,6 +246,18 @@ fn main() -> ExitCode {
                         format_bytes(file.read_requested),
                         format_bytes(file.write_completed),
                         format_bytes(file.write_requested),
+                        file.descriptor_copies,
+                        file.syncs,
+                        file.mappings,
+                        format_bytes(file.mapped_bytes),
+                        file.unmaps,
+                        format_bytes(file.unmapped_bytes),
+                        file.exec_releases,
+                        format_bytes(file.exec_released_bytes),
+                        format_bytes(file.tracked_mapped_bytes),
+                        file.renames,
+                        file.unlinks,
+                        file.directories_created,
                         file.errors
                     );
                 }
