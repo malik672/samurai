@@ -155,17 +155,17 @@ impl CapturePlan {
                 field.kind,
                 CaptureKind::UserString | CaptureKind::KernelString
             ) {
-                if field.capture_size != 128 {
+                if !matches!(field.capture_size, 96 | 112 | 128) {
                     return Err(io::Error::new(
                         io::ErrorKind::Unsupported,
-                        "generic BPF reader currently supports 128-byte user strings",
+                        "generic BPF reader supports 96-, 112-, or 128-byte strings",
                     ));
                 }
                 operations.push(CaptureOperation {
                     source_offset: u32::try_from(field.source_offset).map_err(|_| {
                         io::Error::new(io::ErrorKind::Unsupported, "tracepoint offset exceeds u32")
                     })?,
-                    size: 128,
+                    size: u16::try_from(field.capture_size).unwrap(),
                     destination_word: u16::try_from(field.destination_word).unwrap(),
                     flags: CAPTURE_USER_STRING
                         | if field.kind == CaptureKind::KernelString {

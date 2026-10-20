@@ -6,6 +6,7 @@ pub mod perf;
 pub mod policy;
 pub mod profile;
 pub mod record;
+pub mod report;
 pub mod smr;
 pub mod tracepoint_schema;
 pub mod utils;

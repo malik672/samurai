@@ -22,7 +22,11 @@ Per core memory bandwidth is a new bottleneck:
 
 Static Memory Allocation
 
-Allocate all memory at startup. Don't allocate after initialization.
+Allocate all memory at startup. Don't allocate after initialization. Kernel-side
+state must use bounded BPF maps whose maximum capacity is fixed before the
+program is attached. Runtime map insertion may occupy a preallocated slot, but
+must never imply unbounded growth; capacity exhaustion and update failures must
+be observable.
 
 This centralizes and simplifies resource management, solves fragmentation, forces you to think through “the physics of the system”, and leads to an elegant design, with efficient, predictable performance.can I f
 
@@ -71,3 +75,110 @@ Prefer an application-level wrapper when the application already controls both
 sides of the protocol. Propose a library change only when the guarantee cannot
 be implemented safely or efficiently above the library, or when repeated users
 would otherwise duplicate a substantial abstraction.
+
+# eBPF Hook-Based Profiler — Agent Guidelines
+
+## Core Philosophy
+
+This project is a hook-based Linux profiler built using eBPF
+and Rust.
+
+The profiler observes execution at explicitly instrumented
+kernel and user-space hook points.
+
+It does not provide complete instruction-level execution
+tracing.
+
+Every measurement and conclusion must be supported by
+events observable through the installed hooks.
+
+## Hook Selection
+
+- Prefer stable kernel tracepoints when available.
+- Use fentry/fexit where supported and appropriate.
+- Use kprobes/kretprobes when necessary.
+- Use uprobes/uretprobes for user-space functions.
+- Verify kernel and architecture compatibility.
+- Do not assume all functions can be safely hooked.
+- Consider hook frequency and overhead before attaching.
+
+## Latency Measurement
+
+- Use a consistent monotonic time source.
+- Correlate function entry and exit events correctly.
+- Compute elapsed duration from matching timestamps.
+- Account for recursion, nesting, and concurrent execution.
+- Handle missing entry or exit events gracefully.
+- Distinguish elapsed duration from actual CPU execution time.
+
+Never describe entry-to-exit elapsed time as CPU time
+without additional supporting measurements.
+
+## Event Correlation
+
+- Associate events with the correct process and thread.
+- Preserve timestamps, CPU IDs, and relevant context.
+- Use operation identifiers when tracing asynchronous work.
+- Account for PID/TID reuse and incomplete lifecycles.
+- Do not infer a causal relationship merely because
+  two events occurred close together.
+
+## Kernel-Space Efficiency
+
+- Keep eBPF hook handlers small and predictable.
+- Minimize work performed at high-frequency hooks.
+- Avoid unnecessary map lookups and updates.
+- Perform early filtering where appropriate.
+- Prefer kernel-side aggregation when raw events
+  are not required.
+- Track observable event drops and map failures.
+- Move expensive processing to Rust user space.
+
+## Profiling Output
+
+The profiler should report:
+
+- Hook or function name
+- Process and thread identification
+- Event frequency
+- Measured latency where available
+- Minimum, maximum, and distribution statistics
+- Relevant stack traces when explicitly captured
+- Event loss and collection limitations
+
+Never manufacture missing information.
+
+## Analysis Principles
+
+- Distinguish expensive function execution from
+  delays caused by scheduling or waiting.
+- Investigate repeated operations and unnecessary work.
+- Pay special attention to tail latency.
+- Do not assume the most frequently called function
+  is the primary performance bottleneck.
+- Do not attribute latency to a specific cause
+  without supporting hook measurements.
+
+## Correctness and Validation
+
+- Test entry/exit correlation.
+- Test concurrent and nested execution.
+- Validate timestamps and duration calculations.
+- Test behavior when events are missed.
+- Measure profiler overhead on representative workloads.
+- Verify that hooks detach and resources are cleaned up.
+- Document limitations imposed by the selected hooks.
+
+## Development Rule
+
+Before implementing any profiling feature, establish:
+
+1. What behavior must be measured?
+2. Which hook points expose the necessary information?
+3. What events and identifiers are needed?
+4. How will the measurements be correlated?
+5. What information cannot be observed?
+6. What overhead will the instrumentation introduce?
+
+Never implement a measurement based on assumptions
+about events the profiler does not actually observe.

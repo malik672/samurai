@@ -4,14 +4,16 @@ use crate::{
     bpf::object::ObjectLoader,
     mold::{MappedMold, MappedMoldWorker, MoldEntry},
     policy::PolicyRegistry,
-    smr::{EncodedBatch, PROCESS_COMM_BYTES, PROCESS_METADATA_CAPACITY, SmrProcess, SmrWriter},
+    smr::{
+        EncodedBatch, PROCESS_COMM_BYTES, PROCESS_METADATA_CAPACITY, SmrCwd, SmrProcess, SmrWriter,
+    },
     tracepoint_schema::{
         CaptureField, CaptureKind, CapturePlan, DEFAULT_DYNAMIC_CAPTURE_BYTES,
         GENERIC_CAPTURE_WORDS, TracepointField, capture_plan_with_registry, parse_format,
     },
     utils::tracepoint::TracepointResolver,
 };
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::{
     collections::VecDeque,
     fs, io,
@@ -177,24 +179,80 @@ pub fn run_files_preset(
     output_path: &Path,
 ) -> io::Result<()> {
     let resolver = TracepointResolver::new();
-    let specifications: [(&str, &[&str]); 8] = [
-        ("sys_enter_openat", &["filename", "flags", "mode"]),
-        ("sys_exit_openat", &["ret"]),
-        ("sys_enter_close", &["fd"]),
-        ("sys_exit_close", &["ret"]),
-        ("sys_enter_read", &["fd", "count"]),
-        ("sys_exit_read", &["ret"]),
-        ("sys_enter_write", &["fd", "count"]),
-        ("sys_exit_write", &["ret"]),
+    let specifications: &[(&str, &str, &[&str])] = &[
+        (
+            "syscalls",
+            "sys_enter_openat",
+            &["dfd", "filename", "flags", "mode"],
+        ),
+        ("syscalls", "sys_exit_openat", &["ret"]),
+        (
+            "syscalls",
+            "sys_enter_openat2",
+            &["dfd", "filename", "usize"],
+        ),
+        ("syscalls", "sys_exit_openat2", &["ret"]),
+        ("syscalls", "sys_enter_close", &["fd"]),
+        ("syscalls", "sys_exit_close", &["ret"]),
+        ("syscalls", "sys_enter_read", &["fd", "count"]),
+        ("syscalls", "sys_exit_read", &["ret"]),
+        ("syscalls", "sys_enter_write", &["fd", "count"]),
+        ("syscalls", "sys_exit_write", &["ret"]),
+        ("syscalls", "sys_enter_pread64", &["fd", "count", "pos"]),
+        ("syscalls", "sys_exit_pread64", &["ret"]),
+        ("syscalls", "sys_enter_pwrite64", &["fd", "count", "pos"]),
+        ("syscalls", "sys_exit_pwrite64", &["ret"]),
+        ("syscalls", "sys_enter_readv", &["fd", "vlen"]),
+        ("syscalls", "sys_exit_readv", &["ret"]),
+        ("syscalls", "sys_enter_writev", &["fd", "vlen"]),
+        ("syscalls", "sys_exit_writev", &["ret"]),
+        ("syscalls", "sys_enter_dup", &["fildes"]),
+        ("syscalls", "sys_exit_dup", &["ret"]),
+        ("syscalls", "sys_enter_dup2", &["oldfd", "newfd"]),
+        ("syscalls", "sys_exit_dup2", &["ret"]),
+        ("syscalls", "sys_enter_dup3", &["oldfd", "newfd", "flags"]),
+        ("syscalls", "sys_exit_dup3", &["ret"]),
+        ("syscalls", "sys_enter_rename", &["oldname", "newname"]),
+        ("syscalls", "sys_exit_rename", &["ret"]),
+        (
+            "syscalls",
+            "sys_enter_renameat",
+            &["olddfd", "oldname", "newdfd", "newname"],
+        ),
+        ("syscalls", "sys_exit_renameat", &["ret"]),
+        (
+            "syscalls",
+            "sys_enter_renameat2",
+            &["olddfd", "oldname", "newdfd", "newname", "flags"],
+        ),
+        ("syscalls", "sys_exit_renameat2", &["ret"]),
+        ("syscalls", "sys_enter_unlink", &["pathname"]),
+        ("syscalls", "sys_exit_unlink", &["ret"]),
+        ("syscalls", "sys_enter_mkdir", &["pathname", "mode"]),
+        ("syscalls", "sys_exit_mkdir", &["ret"]),
+        ("syscalls", "sys_enter_fsync", &["fd"]),
+        ("syscalls", "sys_exit_fsync", &["ret"]),
+        ("syscalls", "sys_enter_fdatasync", &["fd"]),
+        ("syscalls", "sys_exit_fdatasync", &["ret"]),
+        ("syscalls", "sys_enter_mmap", &["len", "flags", "fd"]),
+        ("syscalls", "sys_exit_mmap", &["ret"]),
+        ("syscalls", "sys_enter_munmap", &["addr", "len"]),
+        ("syscalls", "sys_exit_munmap", &["ret"]),
+        ("syscalls", "sys_enter_chdir", &["filename"]),
+        ("syscalls", "sys_exit_chdir", &["ret"]),
+        ("syscalls", "sys_enter_fchdir", &["fd"]),
+        ("syscalls", "sys_exit_fchdir", &["ret"]),
+        ("sched", "sched_process_exec", &["pid", "old_pid"]),
     ];
     let plans = specifications
-        .into_iter()
-        .map(|(event, fields)| {
+        .iter()
+        .copied()
+        .map(|(category, event, fields)| {
             let fields = fields
                 .iter()
                 .map(|field| (*field).to_owned())
                 .collect::<Vec<_>>();
-            CapturePlan::discover(&resolver, "syscalls", event, Some(&fields))
+            CapturePlan::discover(&resolver, category, event, Some(&fields))
         })
         .collect::<io::Result<Vec<_>>>()?;
     run_capture(
@@ -283,6 +341,7 @@ fn run_capture(
     }
 
     let mut lifecycle_attachments = Vec::new();
+    let mut initial_cwds = FxHashMap::default();
     if let Some(pid) = filter_pid {
         let tracked_pids = loaded
             .hash_map("tracked_pids")
@@ -290,7 +349,7 @@ fn run_capture(
         let process_metadata = loaded
             .hash_map("process_metadata")
             .ok_or_else(|| missing("process_metadata"))?;
-        seed_process_tree(pid, tracked_pids, process_metadata)?;
+        seed_process_tree(pid, tracked_pids, process_metadata, &mut initial_cwds)?;
         let (parent_offset, child_offset, child_comm_offset) =
             fork_metadata_offsets.expect("PID filtering discovered the fork schema");
         let mut config = [0u8; 16];
@@ -324,7 +383,7 @@ fn run_capture(
         );
         // Close the ordinary setup race for descendants created during the
         // first /proc walk. Future children are propagated by BPF.
-        seed_process_tree(pid, tracked_pids, process_metadata)?;
+        seed_process_tree(pid, tracked_pids, process_metadata, &mut initial_cwds)?;
     }
 
     let slots = loaded
@@ -504,7 +563,12 @@ fn run_capture(
         )?;
         tracked_descendants = Some((descendants_added, tasks_removed));
     }
-    let bytes = writer.finish(received, dropped, &process_metadata)?;
+    let mut initial_cwds = initial_cwds
+        .into_iter()
+        .map(|(pid, path)| SmrCwd { pid, path })
+        .collect::<Vec<_>>();
+    initial_cwds.sort_unstable_by_key(|cwd| cwd.pid);
+    let bytes = writer.finish(received, dropped, &process_metadata, &initial_cwds)?;
     println!(
         "recorded={} received={received} dropped={dropped} bytes={bytes} events={} cpus={cpus:?}",
         output_path.display(),
@@ -697,6 +761,7 @@ fn seed_process_tree(
     root: u32,
     tracked: &crate::bpf::map::HashMap,
     metadata: &crate::bpf::map::HashMap,
+    initial_cwds: &mut FxHashMap<u32, String>,
 ) -> io::Result<()> {
     let root_path = format!("/proc/{root}");
     if !Path::new(&root_path).exists() {
@@ -713,6 +778,13 @@ fn seed_process_tree(
         tracked.write(&pid.to_ne_bytes(), &[1])?;
         if let Some(process) = read_proc_process(pid)? {
             metadata.write(&pid.to_ne_bytes(), &encode_process_metadata(process))?;
+        }
+        match fs::read_link(format!("/proc/{pid}/cwd")) {
+            Ok(cwd) => {
+                initial_cwds.insert(pid, cwd.to_string_lossy().into_owned());
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
         let task_path = format!("/proc/{pid}/task");
         let tasks = match fs::read_dir(task_path) {

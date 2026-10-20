@@ -8,7 +8,13 @@ Live recording TUI (deferred)
   consumers or the recording writer.
 - Reuse the same decoding and statistics layer for live and offline views.
 
-Bare-metal production-topology validation
+Postponed: Standard trace-format export
+
+- Keep `.smr` as Samurai's only recording format for now.
+- Revisit offline CTF 2 export and Babeltrace interoperability after the
+  native recording and analysis workflow is mature.
+
+Postponed: Bare-metal production-topology validation
 
 - Repeat the documented Aya-versus-Mold production-topology benchmark on a
   non-virtualized host with one isolated physical core per Mold consumer.
@@ -19,7 +25,7 @@ Bare-metal production-topology validation
 - Profile the dedicated `consume_lane` loop and test adaptive empty-lane
   backoff only if it improves CPU cost without regressing p99 latency.
 
-RelativeDataLoc live compatibility validation
+Postponed: RelativeDataLoc live compatibility validation
 
 - The Asahi kernel currently exposes zero `__rel_loc` tracepoint fields, so
   the existing parser and capture-plan support cannot be exercised against a
@@ -46,3 +52,13 @@ Postponed: Mold concurrency verification and fuzzing
 - After the E2E test is useful, add focused property/fuzz tests for Mold state
   transitions, tracepoint schemas, record decoding, and malformed BPF objects.
 - Preserve every discovered failure as a deterministic regression test.
+
+Postponed: Broader Samurai testing
+
+- Defer additional integration, end-to-end, workload, compatibility, and
+  regression testing while the syscall presets and report semantics are still
+  being completed.
+- Keep the existing test suite passing as implementation work continues.
+- Before a production-ready claim, test complete recordings and reports on
+  representative file, process, and network workloads, including failures,
+  process descendants, lane overflow, and shutdown draining.

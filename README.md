@@ -11,7 +11,8 @@ cursor, allowing high throughput when many CPUs produce events concurrently.
 
 Samurai can currently answer questions such as:
 
-- Which files did a program and its child processes open?
+- Which files did a program and its child processes open, transfer, map,
+  synchronize, rename, unlink, or create as directories?
 - Which CPUs and processes produced the most events?
 - Which tracepoint field values occurred most frequently?
 
@@ -33,8 +34,7 @@ The executable embeds its generic BPF capture program.
 
 ## Quick start
 
-Record completed file opens, closes, reads, and writes performed by a command
-and its descendants:
+Record completed file operations performed by a command and its descendants:
 
 ```sh
 sudo ./target/release/samurai record --preset files \
@@ -48,6 +48,12 @@ Analyze the recording:
 ./target/release/samurai analyze cargo-build.smr
 ```
 
+Create a self-contained HTML report:
+
+```sh
+./target/release/samurai report cargo-build.smr
+```
+
 The analysis includes event rate, received and dropped records, exact per-CPU
 counts, the captured process tree, busy processes by name and PID, requested
 and completed I/O per file, and frequent captured values. General rankings use
@@ -56,9 +62,35 @@ once from the completed recording's event count. High-cardinality PID and field
 rankings use fixed-capacity tables and label estimates with error bounds.
 
 Preset recordings produce a concise domain-specific report by default. Use
-`samurai analyze --raw` to include the underlying tracepoint rankings. Relative
-paths remain relative because resolving them correctly requires the working
-directory or `openat` directory descriptor from that exact point in time.
+`samurai analyze --raw` to include the underlying tracepoint rankings. The file
+preset correlates `openat`, `openat2`, `close`, `read`, `write`, `pread64`,
+`pwrite64`, `readv`, `writev`, `dup`, `dup2`, `dup3`, `rename`, `renameat`,
+`renameat2`, `unlink`, `mkdir`, `fsync`, `fdatasync`, and file-backed `mmap` and
+`munmap` entry and exit events. It also tracks successful `chdir` and `fchdir` calls.
+It follows duplicated descriptors and resolves relative `openat` paths through
+a captured directory descriptor when that descriptor is known. Paths relative
+to the process working directory use the initial `/proc/PID/cwd` snapshot and
+subsequent successful directory changes when that history is known. If exact
+CWD evidence is missing, the path remains explicitly labeled with that PID's
+unknown CWD rather than being presented as absolute.
+
+`mmap` and `munmap` coverage describes successful file mapping lifecycles,
+including partially unmapped ranges. "Still tracked" means a range was not
+removed by an observed `munmap` or overlapping replacement; process exit and
+`exec` can discard mappings without issuing `munmap`, so it is not proof that
+the memory remained active at capture end.
+The file preset uses `sched_process_exec`, which is emitted only after a
+successful program replacement, to classify those discarded ranges separately
+as released by `exec`. Failed `execve` and `execveat` attempts do not clear the
+tracked mappings.
+Ordinary memory loads and stores through an established mapping are
+not syscalls and therefore do not produce additional events. Vectored I/O
+reports completed bytes; the current capture does not walk user `iovec` arrays
+to calculate requested bytes. Rename records contain both source and destination
+paths. Plain `rename` paths are bounded to 112 bytes each; `renameat` and
+`renameat2` paths are bounded to 96 bytes each to leave room for their directory
+descriptors and flags. All variants fit the existing fixed Mold record without
+increasing every lane's memory footprint.
 
 ## Commands
 
@@ -84,8 +116,12 @@ sudo samurai trace CATEGORY:EVENT \
 sudo samurai record --preset files \
   --command 'COMMAND' --output files.smr
 
-# Validate a completed recording and print its metadata and totals.
-samurai report capture.smr
+# Generate capture.html, or choose a destination with --output.
+samurai report capture.smr [--output report.html]
+
+# Restrict the report to an application process, or remove build tooling.
+samurai report capture.smr --process my-application
+samurai report capture.smr --exclude-process cargo --exclude-process rustc
 
 # Perform bounded offline analysis.
 samurai analyze capture.smr
